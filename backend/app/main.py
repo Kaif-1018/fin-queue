@@ -9,6 +9,7 @@ from sqlalchemy import text
 
 from app.config import settings
 from app.database import engine
+from app.api.v1.jobs import router as jobs_router
 
 
 # ── Lifespan (startup / shutdown) ─────────────────────────────────
@@ -36,6 +37,10 @@ app = FastAPI(
 )
 
 
+# ── Routers ───────────────────────────────────────────────────────
+app.include_router(jobs_router, prefix="/api/v1")
+
+
 # ── Health check ──────────────────────────────────────────────────
 @app.get("/health", tags=["ops"])
 async def health_check():
@@ -50,3 +55,4 @@ async def root():
         "message": f"Welcome to {settings.APP_NAME}",
         "docs": "/docs",
     }
+
