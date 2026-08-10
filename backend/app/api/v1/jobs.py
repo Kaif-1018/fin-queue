@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.models import Job, JobStatus
 from app.schemas import JobCreate, JobListResponse, JobResponse
-from app.tasks import process_job_task
+from app.tasks import process_document_task
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 
@@ -48,7 +48,7 @@ async def create_job(
     await db.refresh(job)     # Refresh to get server-generated defaults
 
     # Enqueue the Celery background task
-    process_job_task.delay(str(job.id))
+    process_document_task.delay(str(job.id))
 
     return job
 
