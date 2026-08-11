@@ -15,6 +15,7 @@ from app.database import Base
 
 class JobStatus(str, enum.Enum):
     """Possible states of a job."""
+    PENDING = "PENDING"
     QUEUED = "QUEUED"
     PROCESSING = "PROCESSING"
     COMPLETED = "COMPLETED"
@@ -40,8 +41,8 @@ class Job(Base):
     status: Mapped[JobStatus] = mapped_column(
         Enum(JobStatus, name="job_status", create_constraint=True),
         nullable=False,
-        default=JobStatus.QUEUED,
-        server_default=text("'QUEUED'"),
+        default=JobStatus.PENDING,
+        server_default=text("'PENDING'"),
         index=True,
     )
     payload: Mapped[dict | None] = mapped_column(

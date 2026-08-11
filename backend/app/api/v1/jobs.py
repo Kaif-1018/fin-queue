@@ -34,18 +34,24 @@ async def create_job(
     """
     Create a new job and enqueue it for background processing.
 
-    1. Insert a new row in the `jobs` table with status `QUEUED`.
-    2. Dispatch a Celery task to process the job asynchronously.
-    3. Return the created job immediately (client polls for status).
+    1. Insert a new row in the `jobs` table with status `PENDING`.
+    2. Commit the transaction so the UUID is generated and the row is
+       visible to Celery workers (avoids a race condition).
+    3. Dispatch a Celery task to process the job asynchronously.
+    4. Return the created job immediately (client polls for status).
     """
     job = Job(
         job_type=body.job_type,
         payload=body.payload,
-        status=JobStatus.QUEUED,
+        status=JobStatus.PENDING,
     )
     db.add(job)
-    await db.flush()          # Flush to generate the UUID without committing
-    await db.refresh(job)     # Refresh to get server-generated defaults
+
+    # Commit *before* dispatching to Celery so the row is visible to
+    # the worker when it queries PostgreSQL.  The get_db dependency's
+    # auto-commit at exit becomes a harmless no-op.
+    await db.commit()
+    await db.refresh(job)     # Populate server-generated defaults (id, timestamps)
 
     # Enqueue the Celery background task
     process_document_task.delay(str(job.id))
@@ -136,7 +142,7 @@ async def cancel_job(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Cancel a job if it is still in QUEUED status.
+    Cancel a job if it is still in PENDING or QUEUED status.
     Jobs that are already PROCESSING, COMPLETED, or FAILED cannot be cancelled.
     """
     job = await db.get(Job, job_id)
@@ -146,11 +152,11 @@ async def cancel_job(
             detail=f"Job {job_id} not found",
         )
 
-    if job.status != JobStatus.QUEUED:
+    if job.status not in (JobStatus.PENDING, JobStatus.QUEUED):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"Cannot cancel job with status '{job.status.value}'. "
-                   f"Only QUEUED jobs can be cancelled.",
+                   f"Only PENDING or QUEUED jobs can be cancelled.",
         )
 
     job.status = JobStatus.FAILED
@@ -159,3 +165,4 @@ async def cancel_job(
     await db.refresh(job)
 
     return job
+
