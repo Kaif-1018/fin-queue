@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.celery_app import celery_app
 from app.config import settings
 from app.models import Job, JobStatus
+from app.pubsub import publish_job_update_sync
 
 # ── Sync database engine for Celery workers ───────────────────────
 # Convert async URL (postgresql+asyncpg://...) to sync (postgresql+psycopg2://...)
@@ -48,6 +49,7 @@ def process_document_task(self, job_id: str) -> dict:
         # ── Mark as PROCESSING ────────────────────────────────
         job.status = JobStatus.PROCESSING
         session.commit()
+        publish_job_update_sync(job_id, JobStatus.PROCESSING.value)
 
         try:
             # ── Simulate a long-running document job (~10 s) ──
@@ -66,6 +68,7 @@ def process_document_task(self, job_id: str) -> dict:
             job.status = JobStatus.COMPLETED
             job.result = result
             session.commit()
+            publish_job_update_sync(job_id, JobStatus.COMPLETED.value, result)
 
             return {"job_id": job_id, "status": "COMPLETED", "result": result}
 
@@ -73,10 +76,12 @@ def process_document_task(self, job_id: str) -> dict:
             # ── Mark as FAILED ────────────────────────────────
             session.rollback()
             job.status = JobStatus.FAILED
-            job.result = {
+            error_result = {
                 "error": str(exc),
                 "traceback": traceback.format_exc(),
             }
+            job.result = error_result
             session.commit()
+            publish_job_update_sync(job_id, JobStatus.FAILED.value, error_result)
 
             return {"job_id": job_id, "status": "FAILED", "error": str(exc)}

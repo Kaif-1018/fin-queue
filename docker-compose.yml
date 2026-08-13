@@ -76,6 +76,18 @@ services:
     volumes:
       - ./backend:/app
 
+  # ─── React Frontend (nginx) ─────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: jobplatform-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+
 volumes:
   postgres_data:
   redis_data:
