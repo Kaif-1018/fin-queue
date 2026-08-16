@@ -1,9 +1,5 @@
-"""
-Pydantic schemas for Job API request/response validation.
-"""
-
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -26,6 +22,24 @@ class JobCreate(BaseModel):
         default=None,
         examples=[{"file_name": "report.pdf", "pages": [1, 2, 3]}],
         description="Optional JSON payload with job parameters.",
+    )
+
+
+class ReportRequest(BaseModel):
+    """Schema for requesting a bulk CSV transaction report."""
+    user_id: uuid.UUID = Field(
+        ...,
+        description="UUID of the user whose transactions to include.",
+    )
+    start_date: date = Field(
+        ...,
+        examples=["2024-01-01"],
+        description="Start of the date range (inclusive).",
+    )
+    end_date: date = Field(
+        ...,
+        examples=["2026-12-31"],
+        description="End of the date range (inclusive).",
     )
 
 

@@ -2,7 +2,8 @@
 Job management API endpoints.
 
 Provides CRUD operations for submitting, querying, listing,
-and cancelling asynchronous jobs.
+and cancelling asynchronous jobs, plus a dedicated endpoint
+for triggering bulk CSV transaction reports.
 """
 
 import uuid
@@ -13,8 +14,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.models import Job, JobStatus
-from app.schemas import JobCreate, JobListResponse, JobResponse
-from app.tasks import process_document_task
+from app.schemas import JobCreate, JobListResponse, JobResponse, ReportRequest
+from app.tasks import generate_bulk_csv_report
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 
@@ -54,7 +55,48 @@ async def create_job(
     await db.refresh(job)     # Populate server-generated defaults (id, timestamps)
 
     # Enqueue the Celery background task
-    process_document_task.delay(str(job.id))
+    generate_bulk_csv_report.delay(str(job.id))
+
+    return job
+
+
+# ── POST /api/v1/jobs/reports — Generate a bulk CSV report ───────
+
+@router.post(
+    "/reports",
+    response_model=JobResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Generate a bulk CSV transaction report",
+)
+async def create_report(
+    body: ReportRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Submit a new bulk CSV report generation job.
+
+    1. Create a `Job` row with type `bulk_csv_report` and the user/date
+       range stored in `payload`.
+    2. Dispatch the `generate_bulk_csv_report` Celery task.
+    3. Return the job immediately — clients can poll or use WebSocket
+       for live status updates.
+    """
+    job = Job(
+        job_type="bulk_csv_report",
+        payload={
+            "user_id": str(body.user_id),
+            "start_date": body.start_date.isoformat(),
+            "end_date": body.end_date.isoformat(),
+        },
+        status=JobStatus.PENDING,
+    )
+    db.add(job)
+
+    await db.commit()
+    await db.refresh(job)
+
+    # Enqueue the report generation task
+    generate_bulk_csv_report.delay(str(job.id))
 
     return job
 
@@ -165,4 +207,3 @@ async def cancel_job(
     await db.refresh(job)
 
     return job
-

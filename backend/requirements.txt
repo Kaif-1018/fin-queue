@@ -21,3 +21,6 @@ pydantic-settings==2.3.4
 
 # WebSocket support (included with uvicorn[standard])
 websockets==12.0
+
+# Data generation (seeding)
+Faker==25.8.0

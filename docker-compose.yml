@@ -54,6 +54,7 @@ services:
         condition: service_healthy
     volumes:
       - ./backend:/app
+      - exports_data:/app/exports
 
   # ─── Celery Worker ────────────────────────────────────────────
   celery_worker:
@@ -75,6 +76,7 @@ services:
         condition: service_healthy
     volumes:
       - ./backend:/app
+      - exports_data:/app/exports
 
   # ─── React Frontend (nginx) ─────────────────────────────────────
   frontend:
@@ -91,3 +93,4 @@ services:
 volumes:
   postgres_data:
   redis_data:
+  exports_data:

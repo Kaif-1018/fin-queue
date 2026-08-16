@@ -6,7 +6,7 @@ import enum
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, Enum, String, Text, text
+from sqlalchemy import DateTime, Enum, Index, Integer, Numeric, String, Text, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -71,3 +71,41 @@ class Job(Base):
 
     def __repr__(self) -> str:
         return f"<Job id={self.id} type={self.job_type} status={self.status}>"
+
+
+class Transaction(Base):
+    """Financial transaction record — seeded with 50K rows for report generation."""
+
+    __tablename__ = "transactions"
+    __table_args__ = (
+        Index("ix_transactions_user_date", "user_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
+        autoincrement=True,
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=False,
+        index=True,
+    )
+    amount: Mapped[float] = mapped_column(
+        Numeric(12, 2),
+        nullable=False,
+    )
+    status: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        index=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        server_default=text("now()"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<Transaction id={self.id} user={self.user_id} amount={self.amount}>"
