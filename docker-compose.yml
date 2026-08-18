@@ -55,6 +55,7 @@ services:
     volumes:
       - ./backend:/app
       - exports_data:/app/exports
+      - uploads_data:/app/uploads
 
   # ─── Celery Worker ────────────────────────────────────────────
   celery_worker:
@@ -77,6 +78,7 @@ services:
     volumes:
       - ./backend:/app
       - exports_data:/app/exports
+      - uploads_data:/app/uploads
 
   # ─── React Frontend (nginx) ─────────────────────────────────────
   frontend:
@@ -94,3 +96,4 @@ volumes:
   postgres_data:
   redis_data:
   exports_data:
+  uploads_data:

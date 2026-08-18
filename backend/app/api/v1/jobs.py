@@ -2,22 +2,27 @@
 Job management API endpoints.
 
 Provides CRUD operations for submitting, querying, listing,
-and cancelling asynchronous jobs, plus a dedicated endpoint
-for triggering bulk CSV transaction reports.
+and cancelling asynchronous jobs, plus dedicated endpoints
+for triggering bulk CSV transaction reports and CSV ingestion.
 """
 
 import uuid
+from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.models import Job, JobStatus
 from app.schemas import JobCreate, JobListResponse, JobResponse, ReportRequest
-from app.tasks import generate_bulk_csv_report
+from app.tasks import generate_bulk_csv_report, ingest_csv
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
+
+# ── Uploads directory ─────────────────────────────────────────────
+UPLOADS_DIR = Path("uploads")
+UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ── POST /api/v1/jobs — Submit a new job ──────────────────────────
@@ -205,5 +210,62 @@ async def cancel_job(
     job.result = {"error": "Job cancelled by user"}
     await db.flush()
     await db.refresh(job)
+
+    return job
+
+
+# ── POST /api/v1/jobs/ingest — Ingest a CSV file ─────────────────
+
+@router.post(
+    "/ingest",
+    response_model=JobResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Ingest a CSV file for bulk processing",
+)
+async def ingest_csv_file(
+    file: UploadFile,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Upload a CSV file for asynchronous bulk ingestion.
+
+    1. Validate the file is a .csv.
+    2. Save the uploaded file to the uploads/ directory.
+    3. Create a Job row with type ``csv_ingestion`` and status ``PENDING``.
+    4. Dispatch the ``ingest_csv`` Celery task.
+    5. Return the job immediately — the client opens a WebSocket on
+       ``/ws/jobs/{job_id}`` to receive live progress (processed / total rows).
+    """
+    # ── Validate file type ────────────────────────────────────
+    if not file.filename or not file.filename.lower().endswith(".csv"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only .csv files are accepted.",
+        )
+
+    # ── Save the uploaded file ────────────────────────────────
+    file_id = uuid.uuid4()
+    saved_name = f"{file_id}_{file.filename}"
+    file_path = UPLOADS_DIR / saved_name
+
+    contents = await file.read()
+    file_path.write_bytes(contents)
+
+    # ── Create the job ────────────────────────────────────────
+    job = Job(
+        job_type="csv_ingestion",
+        payload={
+            "file_name": file.filename,
+            "saved_path": str(file_path),
+        },
+        status=JobStatus.PENDING,
+    )
+    db.add(job)
+
+    await db.commit()
+    await db.refresh(job)
+
+    # ── Dispatch the Celery task ──────────────────────────────
+    ingest_csv.delay(str(job.id), str(file_path))
 
     return job

@@ -157,3 +157,193 @@ def generate_bulk_csv_report(self, job_id: str) -> dict:
             publish_job_update_sync(job_id, JobStatus.FAILED.value, error_result)
 
             return {"job_id": job_id, "status": "FAILED", "error": str(exc)}
+
+
+# ── Celery task: CSV ingestion with DB persistence & analytics ────
+
+@celery_app.task(name="ingest_csv", bind=True, max_retries=3)
+def ingest_csv(self, job_id: str, file_path: str) -> dict:
+    """
+    Ingest a CSV file into PostgreSQL and publish live progress updates.
+
+    Workflow:
+        1. Fetch the job from PostgreSQL.
+        2. Set status → PROCESSING.
+        3. Count total rows in the CSV.
+        4. Parse and batch-insert transactions into PostgreSQL.
+        5. Calculate financial metrics (total volume, status breakdown, date ranges).
+        6. On success → status = COMPLETED, store rich analytics & sample rows.
+        7. On failure → status = FAILED, store error details.
+    """
+    import time
+    from collections import defaultdict
+    import uuid as uuid_pkg
+
+    BATCH_SIZE = 500
+
+    with SyncSession() as session:
+        job: Job | None = session.get(Job, job_id)
+
+        if job is None:
+            return {"error": f"Job {job_id} not found"}
+
+        # ── Mark as PROCESSING ────────────────────────────────
+        job.status = JobStatus.PROCESSING
+        session.commit()
+        publish_job_update_sync(job_id, JobStatus.PROCESSING.value, {"processed": 0, "total": 0})
+
+        try:
+            # ── Count total rows (excluding header) ───────────
+            with open(file_path, "r", encoding="utf-8") as f:
+                total_rows = sum(1 for _ in f) - 1
+                total_rows = max(total_rows, 0)
+
+            progress_interval = max(1, total_rows // 25) if total_rows > 0 else 1
+
+            publish_job_update_sync(
+                job_id,
+                JobStatus.PROCESSING.value,
+                {"processed": 0, "total": total_rows},
+            )
+
+            # ── Process & Insert Transactions in Batches ──────
+            processed = 0
+            total_amount = 0.0
+            status_counts = defaultdict(int)
+            status_amounts = defaultdict(float)
+            user_ids = set()
+            min_date = None
+            max_date = None
+            sample_rows = []
+
+            txn_batch = []
+
+            with open(file_path, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    # Extract fields with safe defaults
+                    raw_user_id = row.get("user_id", "").strip()
+                    raw_amount = row.get("amount", "0").strip()
+                    raw_status = row.get("status", "completed").strip().lower()
+                    raw_date = row.get("created_at", "").strip()
+
+                    try:
+                        parsed_user_id = uuid_pkg.UUID(raw_user_id) if raw_user_id else uuid_pkg.uuid4()
+                    except ValueError:
+                        parsed_user_id = uuid_pkg.uuid4()
+
+                    try:
+                        parsed_amount = float(raw_amount)
+                    except ValueError:
+                        parsed_amount = 0.0
+
+                    try:
+                        parsed_date = datetime.fromisoformat(raw_date) if raw_date else datetime.now(timezone.utc)
+                    except ValueError:
+                        parsed_date = datetime.now(timezone.utc)
+
+                    # Update running stats
+                    total_amount += parsed_amount
+                    status_counts[raw_status] += 1
+                    status_amounts[raw_status] += parsed_amount
+                    user_ids.add(str(parsed_user_id))
+
+                    if min_date is None or parsed_date < min_date:
+                        min_date = parsed_date
+                    if max_date is None or parsed_date > max_date:
+                        max_date = parsed_date
+
+                    # Collect first 10 rows for UI preview table
+                    if len(sample_rows) < 10:
+                        sample_rows.append({
+                            "id": row.get("id", processed + 1),
+                            "user_id": str(parsed_user_id),
+                            "amount": round(parsed_amount, 2),
+                            "status": raw_status,
+                            "created_at": parsed_date.isoformat(),
+                        })
+
+                    # Queue transaction object
+                    txn_batch.append(
+                        Transaction(
+                            user_id=parsed_user_id,
+                            amount=parsed_amount,
+                            status=raw_status,
+                            created_at=parsed_date,
+                        )
+                    )
+
+                    processed += 1
+
+                    # Batch insert to DB
+                    if len(txn_batch) >= BATCH_SIZE:
+                        session.add_all(txn_batch)
+                        session.commit()
+                        txn_batch.clear()
+
+                    # Throttle slightly to keep WebSocket smooth
+                    if processed % 20 == 0:
+                        time.sleep(0.005)
+
+                    # Publish live progress update
+                    if processed % progress_interval == 0 or processed == total_rows:
+                        publish_job_update_sync(
+                            job_id,
+                            JobStatus.PROCESSING.value,
+                            {
+                                "processed": processed,
+                                "total": total_rows,
+                                "total_amount": round(total_amount, 2),
+                            },
+                        )
+
+            # Flush remaining batch
+            if txn_batch:
+                session.add_all(txn_batch)
+                session.commit()
+                txn_batch.clear()
+
+            # ── Mark as COMPLETED with rich analytics ─────────
+            avg_amount = round(total_amount / processed, 2) if processed > 0 else 0.0
+            primary_user_id = next(iter(user_ids)) if user_ids else None
+
+            completed_result = {
+                "status": "COMPLETED",
+                "processed": processed,
+                "total": total_rows,
+                "file_name": Path(file_path).name,
+                "message": f"Successfully ingested {processed:,} transactions into database",
+                "summary": {
+                    "total_amount": round(total_amount, 2),
+                    "avg_amount": avg_amount,
+                    "primary_user_id": primary_user_id,
+                    "unique_users_count": len(user_ids),
+                    "start_date": min_date.isoformat() if min_date else None,
+                    "end_date": max_date.isoformat() if max_date else None,
+                    "status_counts": dict(status_counts),
+                    "status_amounts": {k: round(v, 2) for k, v in status_amounts.items()},
+                },
+                "sample_rows": sample_rows,
+            }
+
+            job.status = JobStatus.COMPLETED
+            job.result = completed_result
+            session.commit()
+            publish_job_update_sync(job_id, JobStatus.COMPLETED.value, completed_result)
+
+            return {"job_id": job_id, "status": "COMPLETED", "result": completed_result}
+
+        except Exception as exc:
+            # ── Mark as FAILED ────────────────────────────────
+            session.rollback()
+            job.status = JobStatus.FAILED
+            error_result = {
+                "status": "FAILED",
+                "error": str(exc),
+                "traceback": traceback.format_exc(),
+            }
+            job.result = error_result
+            session.commit()
+            publish_job_update_sync(job_id, JobStatus.FAILED.value, error_result)
+
+            return {"job_id": job_id, "status": "FAILED", "error": str(exc)}
