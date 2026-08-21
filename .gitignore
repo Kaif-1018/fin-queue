@@ -22,3 +22,6 @@ venv.bak/
 # Generated reports
 exports/
 *.csv
+
+# Local agent guidance (not shared)
+CLAUDE.md

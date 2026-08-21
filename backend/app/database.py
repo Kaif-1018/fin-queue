@@ -12,7 +12,7 @@ from app.config import settings
 # ── Engine ────────────────────────────────────────────────────────
 engine = create_async_engine(
     settings.DATABASE_URL,
-    echo=settings.DEBUG,          # Log SQL in debug mode
+    echo=settings.SQL_ECHO,        # See config: deliberately not tied to DEBUG
     pool_size=10,
     max_overflow=20,
     pool_pre_ping=True,           # Verify connections before use

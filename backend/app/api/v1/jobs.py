@@ -10,13 +10,17 @@ import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, status
+from fastapi.responses import FileResponse
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
+from app.logging_config import get_logger
 from app.models import Job, JobStatus
 from app.schemas import JobCreate, JobListResponse, JobResponse, ReportRequest
-from app.tasks import generate_bulk_csv_report, ingest_csv
+from app.tasks import EXPORTS_DIR, TASK_REGISTRY, generate_bulk_csv_report, ingest_csv
+
+log = get_logger(__name__)
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 
@@ -40,12 +44,24 @@ async def create_job(
     """
     Create a new job and enqueue it for background processing.
 
-    1. Insert a new row in the `jobs` table with status `PENDING`.
-    2. Commit the transaction so the UUID is generated and the row is
+    1. Resolve `job_type` against `TASK_REGISTRY`; reject unknown types with 400
+       rather than silently dispatching the wrong task.
+    2. Insert a new row in the `jobs` table with status `PENDING`.
+    3. Commit the transaction so the UUID is generated and the row is
        visible to Celery workers (avoids a race condition).
-    3. Dispatch a Celery task to process the job asynchronously.
-    4. Return the created job immediately (client polls for status).
+    4. Dispatch the registered Celery task asynchronously.
+    5. Return the created job immediately (client polls or opens a WebSocket).
     """
+    task = TASK_REGISTRY.get(body.job_type)
+    if task is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Unknown job_type '{body.job_type}'. "
+                f"Supported types: {sorted(TASK_REGISTRY)}"
+            ),
+        )
+
     job = Job(
         job_type=body.job_type,
         payload=body.payload,
@@ -60,7 +76,8 @@ async def create_job(
     await db.refresh(job)     # Populate server-generated defaults (id, timestamps)
 
     # Enqueue the Celery background task
-    generate_bulk_csv_report.delay(str(job.id))
+    task.delay(str(job.id))
+    log.info("job.created", job_id=str(job.id), job_type=body.job_type)
 
     return job
 
@@ -208,10 +225,69 @@ async def cancel_job(
 
     job.status = JobStatus.FAILED
     job.result = {"error": "Job cancelled by user"}
-    await db.flush()
+    await db.commit()
     await db.refresh(job)
+    log.info("job.cancelled", job_id=str(job_id))
 
     return job
+
+
+# ── GET /api/v1/jobs/{job_id}/download — Download a generated report ──
+
+@router.get(
+    "/{job_id}/download",
+    summary="Download a completed job's output file",
+    response_class=FileResponse,
+)
+async def download_job_result(
+    job_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Stream the CSV produced by a completed job back to the client.
+
+    Without this the report task writes to a Docker volume that no client can
+    reach, so a `bulk_csv_report` job could complete successfully and still be
+    useless.
+    """
+    job = await db.get(Job, job_id)
+    if job is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Job {job_id} not found",
+        )
+
+    if job.status is not JobStatus.COMPLETED:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Job is '{job.status.value}'; only COMPLETED jobs have output.",
+        )
+
+    result = job.result or {}
+    raw_path = result.get("file_path")
+    if not raw_path:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="This job did not produce a downloadable file.",
+        )
+
+    # Resolve under EXPORTS_DIR and confirm containment: file_path comes out of
+    # a JSONB column, so treat it as untrusted and refuse anything that escapes
+    # the exports directory.
+    exports_root = EXPORTS_DIR.resolve()
+    file_path = Path(raw_path).resolve()
+    if not file_path.is_relative_to(exports_root) or not file_path.is_file():
+        log.warning("download.missing_or_escaped", job_id=str(job_id), path=raw_path)
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Output file is no longer available.",
+        )
+
+    return FileResponse(
+        path=file_path,
+        media_type="text/csv",
+        filename=result.get("file_name") or file_path.name,
+    )
 
 
 # ── POST /api/v1/jobs/ingest — Ingest a CSV file ─────────────────

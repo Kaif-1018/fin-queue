@@ -4,6 +4,8 @@ Async Job Processing Platform - Configuration
 Loads all settings from environment variables using pydantic-settings.
 """
 
+from typing import Literal
+
 from pydantic_settings import BaseSettings
 
 
@@ -23,6 +25,17 @@ class Settings(BaseSettings):
     # ── App ───────────────────────────────────────────────────────
     APP_NAME: str = "Async Job Processing Platform"
     DEBUG: bool = True
+
+    # ── Logging ───────────────────────────────────────────────────
+    # "console" for colourised local output, "json" for machine-parseable logs.
+    LOG_FORMAT: Literal["console", "json"] = "console"
+    LOG_LEVEL: str = "INFO"
+
+    # Echo every SQL statement. Kept separate from DEBUG on purpose: with
+    # echo=True SQLAlchemy's InstanceLogger bypasses log-level checks entirely,
+    # so this cannot be quietened after the fact — and it logs bound parameters,
+    # which is a data-leak risk anywhere real.
+    SQL_ECHO: bool = False
 
     class Config:
         env_file = ".env"

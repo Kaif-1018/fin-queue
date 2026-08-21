@@ -5,8 +5,9 @@ SQLAlchemy ORM models for the Async Job Processing Platform.
 import enum
 import uuid
 from datetime import datetime, timezone
+from decimal import Decimal
 
-from sqlalchemy import DateTime, Enum, Index, Integer, Numeric, String, Text, text
+from sqlalchemy import DateTime, Enum, Index, Integer, Numeric, String, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -91,7 +92,8 @@ class Transaction(Base):
         nullable=False,
         index=True,
     )
-    amount: Mapped[float] = mapped_column(
+    # Money: Numeric(12, 2) maps to Decimal, never float. See CLAUDE.md.
+    amount: Mapped[Decimal] = mapped_column(
         Numeric(12, 2),
         nullable=False,
     )

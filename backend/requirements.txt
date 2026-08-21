@@ -19,6 +19,9 @@ redis==5.0.7
 # Settings management
 pydantic-settings==2.3.4
 
+# Structured logging
+structlog==24.2.0
+
 # WebSocket support (included with uvicorn[standard])
 websockets==12.0
 
