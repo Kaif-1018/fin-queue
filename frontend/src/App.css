@@ -358,6 +358,22 @@
   border: 1px solid rgba(239, 68, 68, 0.3);
 }
 
+/* Deliberately neutral, not red — a cancelled job is not a failed one. */
+.result-cancelled {
+  background: rgba(148, 163, 184, 0.06);
+  border: 1px solid rgba(148, 163, 184, 0.28);
+}
+
+.result-cancelled .result-card-title {
+  color: #94a3b8;
+}
+
+.cancelled-note {
+  margin: 0;
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+
 .result-card-header {
   margin-bottom: 1rem;
 }

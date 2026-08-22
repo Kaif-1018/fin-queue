@@ -14,7 +14,15 @@ const STATUS_STYLES = {
   PROCESSING: { bg: '#dbeafe', color: '#1e40af', label: 'PROCESSING' },
   COMPLETED:  { bg: '#d1fae5', color: '#065f46', label: 'COMPLETED' },
   FAILED:     { bg: '#fee2e2', color: '#991b1b', label: 'FAILED' },
+  // Neutral, not red: the user stopped this job, nothing broke.
+  CANCELLED:  { bg: '#e5e7eb', color: '#4b5563', label: 'CANCELLED' },
 };
+
+// Statuses a job never moves out of. Mirrors app/state.py TERMINAL_STATUSES —
+// a status missing from here leaves its WebSocket open forever and the card
+// stuck showing progress.
+const TERMINAL_STATUSES = new Set(['COMPLETED', 'FAILED', 'CANCELLED']);
+const isTerminal = (status) => TERMINAL_STATUSES.has(status);
 
 function StatusBadge({ status }) {
   const style = STATUS_STYLES[status] || { bg: '#f3f4f6', color: '#374151', label: status };
@@ -84,7 +92,7 @@ export default function App() {
       try {
         const msg = JSON.parse(event.data);
 
-        if (msg.status === 'COMPLETED' || msg.status === 'FAILED') {
+        if (isTerminal(msg.status)) {
           terminalJobsRef.current.add(jobId);
         }
 
@@ -92,7 +100,7 @@ export default function App() {
           prev.map(j => {
             if (j.id !== jobId) return j;
 
-            const isTerminal = msg.status === 'COMPLETED' || msg.status === 'FAILED';
+            const terminal = isTerminal(msg.status);
             const updated = { ...j };
 
             if (msg.status && msg.status !== j.status) {
@@ -117,7 +125,7 @@ export default function App() {
             }
 
             if (msg.result) updated.result = msg.result;
-            if (isTerminal) {
+            if (terminal) {
               updated.wsState = WS_STATE.IDLE;
               updated.wsError = null;
             }
@@ -188,8 +196,7 @@ export default function App() {
       if (Array.isArray(data.items)) {
         setJobs(
           data.items.map(item => {
-            const isTerminal = item.status === 'COMPLETED' || item.status === 'FAILED';
-            if (isTerminal) terminalJobsRef.current.add(item.id);
+            if (isTerminal(item.status)) terminalJobsRef.current.add(item.id);
 
             return {
               id: item.id,
@@ -394,7 +401,8 @@ export default function App() {
         {jobs.map(job => {
           const isCompleted = job.status === 'COMPLETED';
           const isFailed = job.status === 'FAILED';
-          const isProcessing = job.status === 'PROCESSING' || job.status === 'PENDING' || job.status === 'QUEUED';
+          const isCancelled = job.status === 'CANCELLED';
+          const isProcessing = !isTerminal(job.status);
           const totalRows = job.result?.total || job.progress?.total || 0;
           const processedRows = job.result?.processed || job.progress?.processed || 0;
           const pct = isCompleted ? 100 : (job.progress?.percentage ?? 0);
@@ -585,6 +593,18 @@ export default function App() {
                     <span className="result-card-title">❌ Ingestion Failed</span>
                   </div>
                   <pre className="job-result job-result-error">{JSON.stringify(job.result, null, 2)}</pre>
+                </div>
+              )}
+
+              {/* ── CANCELLED: Notice ──────────────────────────── */}
+              {isCancelled && (
+                <div className="result-card result-cancelled">
+                  <div className="result-card-header">
+                    <span className="result-card-title">⊘ Cancelled</span>
+                  </div>
+                  <p className="cancelled-note">
+                    {job.result?.message || 'This job was cancelled before it started processing.'}
+                  </p>
                 </div>
               )}
 

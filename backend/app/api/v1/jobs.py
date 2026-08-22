@@ -14,10 +14,12 @@ from fastapi.responses import FileResponse
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.celery_app import celery_app
 from app.database import get_db
 from app.logging_config import get_logger
 from app.models import Job, JobStatus
 from app.schemas import JobCreate, JobListResponse, JobResponse, ReportRequest
+from app.state import transition
 from app.tasks import EXPORTS_DIR, TASK_REGISTRY, generate_bulk_csv_report, ingest_csv
 
 log = get_logger(__name__)
@@ -46,7 +48,8 @@ async def create_job(
 
     1. Resolve `job_type` against `TASK_REGISTRY`; reject unknown types with 400
        rather than silently dispatching the wrong task.
-    2. Insert a new row in the `jobs` table with status `PENDING`.
+    2. Insert a new row in the `jobs` table with status `PENDING`, carrying the
+       Celery task id we are about to dispatch under.
     3. Commit the transaction so the UUID is generated and the row is
        visible to Celery workers (avoids a race condition).
     4. Dispatch the registered Celery task asynchronously.
@@ -62,10 +65,16 @@ async def create_job(
             ),
         )
 
+    # Mint the Celery task id here rather than reading it back off .delay(), so
+    # it is committed *before* the task can run. Otherwise a job cancelled in
+    # that window has no task id to revoke.
+    task_id = str(uuid.uuid4())
+
     job = Job(
         job_type=body.job_type,
         payload=body.payload,
         status=JobStatus.PENDING,
+        celery_task_id=task_id,
     )
     db.add(job)
 
@@ -76,8 +85,13 @@ async def create_job(
     await db.refresh(job)     # Populate server-generated defaults (id, timestamps)
 
     # Enqueue the Celery background task
-    task.delay(str(job.id))
-    log.info("job.created", job_id=str(job.id), job_type=body.job_type)
+    task.apply_async(args=[str(job.id)], task_id=task_id)
+    log.info(
+        "job.created",
+        job_id=str(job.id),
+        job_type=body.job_type,
+        task_id=task_id,
+    )
 
     return job
 
@@ -103,6 +117,8 @@ async def create_report(
     3. Return the job immediately — clients can poll or use WebSocket
        for live status updates.
     """
+    task_id = str(uuid.uuid4())
+
     job = Job(
         job_type="bulk_csv_report",
         payload={
@@ -111,6 +127,7 @@ async def create_report(
             "end_date": body.end_date.isoformat(),
         },
         status=JobStatus.PENDING,
+        celery_task_id=task_id,
     )
     db.add(job)
 
@@ -118,7 +135,8 @@ async def create_report(
     await db.refresh(job)
 
     # Enqueue the report generation task
-    generate_bulk_csv_report.delay(str(job.id))
+    generate_bulk_csv_report.apply_async(args=[str(job.id)], task_id=task_id)
+    log.info("report.requested", job_id=str(job.id), task_id=task_id)
 
     return job
 
@@ -207,7 +225,16 @@ async def cancel_job(
 ):
     """
     Cancel a job if it is still in PENDING or QUEUED status.
-    Jobs that are already PROCESSING, COMPLETED, or FAILED cannot be cancelled.
+
+    Jobs that are already PROCESSING, COMPLETED, FAILED, or CANCELLED cannot be
+    cancelled — the tasks have no cooperative abort, so accepting a mid-flight
+    cancel would report something untrue.
+
+    Two things stop a cancelled job from running. Revoking the Celery task keeps
+    a worker from dequeuing it, but revocation is in-memory per worker and is
+    lost if the worker restarts. The durable guarantee is the state machine: the
+    task's claim of CANCELLED → PROCESSING is illegal, so even a worker that
+    never saw the revoke refuses the work and leaves the row cancelled.
     """
     job = await db.get(Job, job_id)
     if job is None:
@@ -223,11 +250,34 @@ async def cancel_job(
                    f"Only PENDING or QUEUED jobs can be cancelled.",
         )
 
-    job.status = JobStatus.FAILED
-    job.result = {"error": "Job cancelled by user"}
-    await db.commit()
+    task_id = job.celery_task_id
+
+    cancelled = await transition(
+        db,
+        job_id,
+        JobStatus.CANCELLED,
+        {"message": "Job cancelled by user"},
+        strict=False,
+    )
+    if not cancelled:
+        # A worker claimed the job between the check above and the row lock.
+        await db.refresh(job)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Job started processing before it could be cancelled "
+                   f"(now '{job.status.value}').",
+        )
+
+    # Best effort: the row is already authoritative, so a broker hiccup here
+    # must not fail the request.
+    if task_id:
+        try:
+            celery_app.control.revoke(task_id)
+        except Exception:
+            log.exception("job.revoke_failed", job_id=str(job_id), task_id=task_id)
+
     await db.refresh(job)
-    log.info("job.cancelled", job_id=str(job_id))
+    log.info("job.cancelled", job_id=str(job_id), task_id=task_id)
 
     return job
 
@@ -328,6 +378,8 @@ async def ingest_csv_file(
     file_path.write_bytes(contents)
 
     # ── Create the job ────────────────────────────────────────
+    task_id = str(uuid.uuid4())
+
     job = Job(
         job_type="csv_ingestion",
         payload={
@@ -335,6 +387,7 @@ async def ingest_csv_file(
             "saved_path": str(file_path),
         },
         status=JobStatus.PENDING,
+        celery_task_id=task_id,
     )
     db.add(job)
 
@@ -342,6 +395,12 @@ async def ingest_csv_file(
     await db.refresh(job)
 
     # ── Dispatch the Celery task ──────────────────────────────
-    ingest_csv.delay(str(job.id), str(file_path))
+    ingest_csv.apply_async(args=[str(job.id), str(file_path)], task_id=task_id)
+    log.info(
+        "ingest.requested",
+        job_id=str(job.id),
+        task_id=task_id,
+        file_name=file.filename,
+    )
 
     return job

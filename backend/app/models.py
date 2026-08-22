@@ -15,12 +15,18 @@ from app.database import Base
 
 
 class JobStatus(str, enum.Enum):
-    """Possible states of a job."""
+    """Possible states of a job.
+
+    The permitted moves between these live in :data:`app.state.ALLOWED_TRANSITIONS`,
+    and every write goes through ``app.state.transition``. CANCELLED is distinct
+    from FAILED on purpose: a job the user stopped is not a job that broke.
+    """
     PENDING = "PENDING"
     QUEUED = "QUEUED"
     PROCESSING = "PROCESSING"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
 
 
 class Job(Base):
@@ -40,7 +46,10 @@ class Job(Base):
         index=True,
     )
     status: Mapped[JobStatus] = mapped_column(
-        Enum(JobStatus, name="job_status", create_constraint=True),
+        # create_constraint=False: migration 001 creates a native Postgres enum
+        # with no CHECK constraint. Asking for one here makes --autogenerate
+        # propose adding a constraint the real schema does not have.
+        Enum(JobStatus, name="job_status", create_constraint=False),
         nullable=False,
         default=JobStatus.PENDING,
         server_default=text("'PENDING'"),
@@ -55,6 +64,16 @@ class Job(Base):
         JSONB,
         nullable=True,
         default=None,
+    )
+    # Set once the broker accepts the dispatch, so cancelling a job can revoke
+    # the task instead of letting a worker dequeue work nobody wants. Nullable:
+    # a row exists briefly before .delay() returns, and rows predating this
+    # column have none.
+    celery_task_id: Mapped[str | None] = mapped_column(
+        String(155),
+        nullable=True,
+        default=None,
+        index=True,
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

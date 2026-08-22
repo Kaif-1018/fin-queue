@@ -26,6 +26,7 @@ from app.config import settings
 from app.logging_config import get_logger
 from app.models import Job, JobStatus, Transaction
 from app.pubsub import publish_job_update_sync
+from app.state import as_uuid, claim_sync, transition_sync
 
 log = get_logger(__name__)
 
@@ -143,20 +144,33 @@ def generate_bulk_csv_report(self, job_id: str) -> dict:
     Generate a CSV report of transactions for a specific user and date range.
 
     Workflow:
-        1. Fetch the job from PostgreSQL; extract user_id, start_date, end_date.
-        2. Set status → PROCESSING.
+        1. Fetch the job from PostgreSQL and claim it (idempotency guard).
+        2. Extract user_id, start_date, end_date from the payload.
         3. Query the Transactions table with chunked streaming (yield_per).
         4. Stream chunks into a CSV file in the exports/ directory.
         5. On success → status = COMPLETED, store file_path + total_rows.
         6. On failure → status = FAILED, store error details.
-        7. Fire Redis Pub/Sub event for every status transition.
+
+    Every status change goes through ``transition_sync``, which locks the row,
+    validates the move, commits, and publishes to Redis as one call.
     """
     with sync_session() as session:
-        job: Job | None = session.get(Job, job_id)
+        job: Job | None = session.get(Job, as_uuid(job_id))
 
         if job is None:
             log.warning("job.not_found", job_id=job_id, task="generate_bulk_csv_report")
             return {"error": f"Job {job_id} not found"}
+
+        # ── Claim the job ─────────────────────────────────────
+        # A locked compare-and-set to PROCESSING. task_acks_late=True means the
+        # broker redelivers anything whose ack was lost, so this is what stops a
+        # finished report from being regenerated — and a cancelled one from
+        # running at all.
+        if not claim_sync(session, job_id):
+            log.info("report.claim_rejected", job_id=job_id, status=job.status.value)
+            return {"job_id": job_id, "status": job.status.value, "skipped": True}
+
+        log.info("report.started", job_id=job_id)
 
         # ── Extract payload parameters ────────────────────────
         payload = job.payload or {}
@@ -165,13 +179,10 @@ def generate_bulk_csv_report(self, job_id: str) -> dict:
         end_date = payload.get("end_date")
 
         if not all([user_id, start_date, end_date]):
-            job.status = JobStatus.FAILED
             error_result = {
                 "error": "Missing required payload fields: user_id, start_date, end_date",
             }
-            job.result = error_result
-            session.commit()
-            publish_job_update_sync(job_id, JobStatus.FAILED.value, error_result)
+            transition_sync(session, job_id, JobStatus.FAILED, error_result)
             log.error("report.invalid_payload", job_id=job_id)
             return {"job_id": job_id, "status": "FAILED", "error": error_result["error"]}
 
@@ -180,19 +191,10 @@ def generate_bulk_csv_report(self, job_id: str) -> dict:
             start_dt = datetime.fromisoformat(str(start_date))
             end_dt = datetime.fromisoformat(str(end_date))
         except (ValueError, TypeError) as e:
-            job.status = JobStatus.FAILED
             error_result = {"error": f"Invalid date format: {e}"}
-            job.result = error_result
-            session.commit()
-            publish_job_update_sync(job_id, JobStatus.FAILED.value, error_result)
+            transition_sync(session, job_id, JobStatus.FAILED, error_result)
             log.error("report.invalid_dates", job_id=job_id, error=str(e))
             return {"job_id": job_id, "status": "FAILED", "error": error_result["error"]}
-
-        # ── Mark as PROCESSING ────────────────────────────────
-        job.status = JobStatus.PROCESSING
-        session.commit()
-        publish_job_update_sync(job_id, JobStatus.PROCESSING.value)
-        log.info("report.started", job_id=job_id, user_id=user_id)
 
         try:
             # ── Build the query ───────────────────────────────
@@ -237,25 +239,25 @@ def generate_bulk_csv_report(self, job_id: str) -> dict:
                 "end_date": end_date,
             }
 
-            job.status = JobStatus.COMPLETED
-            job.result = completed_result
-            session.commit()
-            publish_job_update_sync(job_id, JobStatus.COMPLETED.value, completed_result)
+            transition_sync(session, job_id, JobStatus.COMPLETED, completed_result)
             log.info("report.completed", job_id=job_id, total_rows=total_rows)
 
             return {"job_id": job_id, "status": "COMPLETED", "result": completed_result}
 
         except Exception as exc:
             # ── Mark as FAILED ────────────────────────────────
+            # Roll back first: the failed statement may have left the session
+            # unusable, and transition_sync needs to issue a SELECT ... FOR UPDATE.
             session.rollback()
-            job.status = JobStatus.FAILED
             error_result = {
                 "error": str(exc),
                 "traceback": traceback.format_exc(),
             }
-            job.result = error_result
-            session.commit()
-            publish_job_update_sync(job_id, JobStatus.FAILED.value, error_result)
+            # strict=False: if the status has moved on under us, log it rather
+            # than raising a second exception that would mask this one.
+            transition_sync(
+                session, job_id, JobStatus.FAILED, error_result, strict=False
+            )
             log.exception("report.failed", job_id=job_id)
 
             return {"job_id": job_id, "status": "FAILED", "error": str(exc)}
@@ -274,35 +276,45 @@ def ingest_csv(self, job_id: str, file_path: str | None = None) -> dict:
     ``TASK_REGISTRY`` share the same ``(job_id)`` dispatch signature.
 
     Workflow:
-        1. Fetch the job from PostgreSQL.
-        2. Set status → PROCESSING.
-        3. Count total rows in the CSV.
-        4. Parse and batch-insert transactions into PostgreSQL.
-        5. Calculate financial metrics (total volume, status breakdown, date ranges).
-        6. On success → status = COMPLETED, store rich analytics & sample rows.
-        7. On failure → status = FAILED, store error details.
+        1. Fetch the job from PostgreSQL and claim it (idempotency guard).
+        2. Count total rows in the CSV.
+        3. Parse and batch-insert transactions into PostgreSQL.
+        4. Calculate financial metrics (total volume, status breakdown, date ranges).
+        5. On success → status = COMPLETED, store rich analytics & sample rows.
+        6. On failure → status = FAILED, store error details.
+
+    Status changes go through ``transition_sync``. Progress updates do not — see
+    the comment on the first ``publish_job_update_sync`` call below.
     """
     with sync_session() as session:
-        job: Job | None = session.get(Job, job_id)
+        job: Job | None = session.get(Job, as_uuid(job_id))
 
         if job is None:
             log.warning("job.not_found", job_id=job_id, task="ingest_csv")
             return {"error": f"Job {job_id} not found"}
 
+        # ── Claim the job ─────────────────────────────────────
+        # This is the guard that matters most here: re-running a finished ingest
+        # would insert every row a second time. The row lock makes the check and
+        # the write to PROCESSING atomic, so two redelivered copies cannot both
+        # get through.
+        if not claim_sync(session, job_id):
+            log.info("ingest.claim_rejected", job_id=job_id, status=job.status.value)
+            return {"job_id": job_id, "status": job.status.value, "skipped": True}
+
         # ── Resolve the source file ───────────────────────────
         file_path = file_path or (job.payload or {}).get("saved_path")
         if not file_path:
-            job.status = JobStatus.FAILED
             error_result = {"error": "No source file: payload is missing 'saved_path'"}
-            job.result = error_result
-            session.commit()
-            publish_job_update_sync(job_id, JobStatus.FAILED.value, error_result)
+            transition_sync(session, job_id, JobStatus.FAILED, error_result)
             log.error("ingest.no_source_file", job_id=job_id)
             return {"job_id": job_id, "status": "FAILED", "error": error_result["error"]}
 
-        # ── Mark as PROCESSING ────────────────────────────────
-        job.status = JobStatus.PROCESSING
-        session.commit()
+        # Progress updates re-publish PROCESSING with a row count, so they are
+        # *not* status changes and must not go through transition_sync —
+        # PROCESSING → PROCESSING is illegal by design (that rule is what makes
+        # the claim above work). Publish these directly. This first one gives the
+        # UI something to show while the row count below is still running.
         publish_job_update_sync(
             job_id, JobStatus.PROCESSING.value, {"processed": 0, "total": 0}
         )
@@ -426,26 +438,25 @@ def ingest_csv(self, job_id: str, file_path: str | None = None) -> dict:
                 "sample_rows": sample_rows,
             }
 
-            job.status = JobStatus.COMPLETED
-            job.result = completed_result
-            session.commit()
-            publish_job_update_sync(job_id, JobStatus.COMPLETED.value, completed_result)
+            transition_sync(session, job_id, JobStatus.COMPLETED, completed_result)
             log.info("ingest.completed", job_id=job_id, processed=processed)
 
             return {"job_id": job_id, "status": "COMPLETED", "result": completed_result}
 
         except Exception as exc:
             # ── Mark as FAILED ────────────────────────────────
+            # Roll back first: the failed statement may have left the session
+            # unusable, and transition_sync needs to issue a SELECT ... FOR UPDATE.
             session.rollback()
-            job.status = JobStatus.FAILED
             error_result = {
                 "status": "FAILED",
                 "error": str(exc),
                 "traceback": traceback.format_exc(),
             }
-            job.result = error_result
-            session.commit()
-            publish_job_update_sync(job_id, JobStatus.FAILED.value, error_result)
+            # strict=False: never raise out of the error path and mask *this* error.
+            transition_sync(
+                session, job_id, JobStatus.FAILED, error_result, strict=False
+            )
             log.exception("ingest.failed", job_id=job_id)
 
             return {"job_id": job_id, "status": "FAILED", "error": str(exc)}
