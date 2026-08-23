@@ -4,6 +4,10 @@ Job management API endpoints.
 Provides CRUD operations for submitting, querying, listing,
 and cancelling asynchronous jobs, plus dedicated endpoints
 for triggering bulk CSV transaction reports and CSV ingestion.
+
+Every endpoint here is scoped to the authenticated caller. Jobs the caller does
+not own return **404, not 403** — a 403 confirms the UUID exists, which is a
+membership oracle over the whole jobs table.
 """
 
 import uuid
@@ -16,8 +20,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.celery_app import celery_app
 from app.database import get_db
+from app.deps import get_current_user
 from app.logging_config import get_logger
-from app.models import Job, JobStatus
+from app.models import Job, JobStatus, User
 from app.schemas import JobCreate, JobListResponse, JobResponse, ReportRequest
 from app.state import transition
 from app.tasks import EXPORTS_DIR, TASK_REGISTRY, generate_bulk_csv_report, ingest_csv
@@ -31,6 +36,41 @@ UPLOADS_DIR = Path("uploads")
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
 
+# ── Ownership ─────────────────────────────────────────────────────
+
+NOT_FOUND = "Job {job_id} not found"
+
+
+async def _get_owned_job(
+    db: AsyncSession,
+    job_id: uuid.UUID,
+    current_user: User,
+) -> Job:
+    """Load a job the caller owns, or raise 404.
+
+    A job that exists but belongs to someone else raises the *same* 404 as one
+    that does not exist, so the response cannot be used to probe for valid job
+    ids. Legacy rows with a NULL ``user_id`` match no user and so 404 for
+    everyone, which is the intended outcome of leaving them unowned.
+    """
+    job = await db.get(Job, job_id)
+
+    if job is None or job.user_id != current_user.id:
+        if job is not None:
+            log.warning(
+                "job.access_denied",
+                job_id=str(job_id),
+                user_id=str(current_user.id),
+                owner_id=str(job.user_id) if job.user_id else None,
+            )
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=NOT_FOUND.format(job_id=job_id),
+        )
+
+    return job
+
+
 # ── POST /api/v1/jobs — Submit a new job ──────────────────────────
 
 @router.post(
@@ -42,14 +82,16 @@ UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 async def create_job(
     body: JobCreate,
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """
     Create a new job and enqueue it for background processing.
 
     1. Resolve `job_type` against `TASK_REGISTRY`; reject unknown types with 400
        rather than silently dispatching the wrong task.
-    2. Insert a new row in the `jobs` table with status `PENDING`, carrying the
-       Celery task id we are about to dispatch under.
+    2. Insert a new row in the `jobs` table with status `PENDING`, owned by the
+       authenticated caller, carrying the Celery task id we are about to
+       dispatch under.
     3. Commit the transaction so the UUID is generated and the row is
        visible to Celery workers (avoids a race condition).
     4. Dispatch the registered Celery task asynchronously.
@@ -75,6 +117,7 @@ async def create_job(
         payload=body.payload,
         status=JobStatus.PENDING,
         celery_task_id=task_id,
+        user_id=current_user.id,
     )
     db.add(job)
 
@@ -91,6 +134,7 @@ async def create_job(
         job_id=str(job.id),
         job_type=body.job_type,
         task_id=task_id,
+        user_id=str(current_user.id),
     )
 
     return job
@@ -107,36 +151,48 @@ async def create_job(
 async def create_report(
     body: ReportRequest,
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """
     Submit a new bulk CSV report generation job.
 
-    1. Create a `Job` row with type `bulk_csv_report` and the user/date
-       range stored in `payload`.
+    1. Create a `Job` row with type `bulk_csv_report`, owned by the caller, with
+       the date range stored in `payload`.
     2. Dispatch the `generate_bulk_csv_report` Celery task.
     3. Return the job immediately — clients can poll or use WebSocket
        for live status updates.
+
+    The report covers **the caller's own transactions only**. The user id comes
+    from the bearer token and is never read from the request body — `ReportRequest`
+    has no such field. This endpoint previously took `body.user_id` verbatim,
+    which let any caller export any user's transaction history.
     """
     task_id = str(uuid.uuid4())
 
     job = Job(
         job_type="bulk_csv_report",
         payload={
-            "user_id": str(body.user_id),
             "start_date": body.start_date.isoformat(),
             "end_date": body.end_date.isoformat(),
         },
         status=JobStatus.PENDING,
         celery_task_id=task_id,
+        user_id=current_user.id,
     )
     db.add(job)
 
     await db.commit()
     await db.refresh(job)
 
-    # Enqueue the report generation task
+    # Enqueue the report generation task. It reads the owner off the job row, so
+    # there is no user id on the wire to tamper with.
     generate_bulk_csv_report.apply_async(args=[str(job.id)], task_id=task_id)
-    log.info("report.requested", job_id=str(job.id), task_id=task_id)
+    log.info(
+        "report.requested",
+        job_id=str(job.id),
+        task_id=task_id,
+        user_id=str(current_user.id),
+    )
 
     return job
 
@@ -151,15 +207,10 @@ async def create_report(
 async def get_job(
     job_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
-    """Retrieve a single job by its UUID."""
-    job = await db.get(Job, job_id)
-    if job is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Job {job_id} not found",
-        )
-    return job
+    """Retrieve one of the caller's own jobs by its UUID."""
+    return await _get_owned_job(db, job_id, current_user)
 
 
 # ── GET /api/v1/jobs — List all jobs (paginated) ─────────────────
@@ -167,7 +218,7 @@ async def get_job(
 @router.get(
     "",
     response_model=JobListResponse,
-    summary="List all jobs",
+    summary="List the caller's jobs",
 )
 async def list_jobs(
     status_filter: JobStatus | None = Query(
@@ -179,14 +230,19 @@ async def list_jobs(
     limit: int = Query(default=20, ge=1, le=100, description="Page size"),
     offset: int = Query(default=0, ge=0, description="Offset"),
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """
-    List jobs with optional filtering by status and/or job_type.
+    List the caller's own jobs, with optional filtering by status and/or job_type.
     Supports pagination via `limit` and `offset`.
     """
-    # Build base query
-    query = select(Job)
-    count_query = select(func.count(Job.id))
+    # Owner filter goes on the base of *both* queries below. Applying it to the
+    # page query alone would return the caller's rows under someone else's
+    # total, so the UI would page through empty screens.
+    owned = Job.user_id == current_user.id
+
+    query = select(Job).where(owned)
+    count_query = select(func.count(Job.id)).where(owned)
 
     if status_filter is not None:
         query = query.where(Job.status == status_filter)
@@ -222,9 +278,10 @@ async def list_jobs(
 async def cancel_job(
     job_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """
-    Cancel a job if it is still in PENDING or QUEUED status.
+    Cancel one of the caller's jobs if it is still in PENDING or QUEUED status.
 
     Jobs that are already PROCESSING, COMPLETED, FAILED, or CANCELLED cannot be
     cancelled — the tasks have no cooperative abort, so accepting a mid-flight
@@ -236,12 +293,7 @@ async def cancel_job(
     task's claim of CANCELLED → PROCESSING is illegal, so even a worker that
     never saw the revoke refuses the work and leaves the row cancelled.
     """
-    job = await db.get(Job, job_id)
-    if job is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Job {job_id} not found",
-        )
+    job = await _get_owned_job(db, job_id, current_user)
 
     if job.status not in (JobStatus.PENDING, JobStatus.QUEUED):
         raise HTTPException(
@@ -292,20 +344,20 @@ async def cancel_job(
 async def download_job_result(
     job_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """
-    Stream the CSV produced by a completed job back to the client.
+    Stream the CSV produced by one of the caller's completed jobs.
 
     Without this the report task writes to a Docker volume that no client can
     reach, so a `bulk_csv_report` job could complete successfully and still be
     useless.
+
+    Ownership is checked before anything else. This endpoint used to serve any
+    job's CSV to anyone who guessed its UUID — and a report CSV is a full dump
+    of one user's transaction history.
     """
-    job = await db.get(Job, job_id)
-    if job is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Job {job_id} not found",
-        )
+    job = await _get_owned_job(db, job_id, current_user)
 
     if job.status is not JobStatus.COMPLETED:
         raise HTTPException(
@@ -351,16 +403,21 @@ async def download_job_result(
 async def ingest_csv_file(
     file: UploadFile,
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """
     Upload a CSV file for asynchronous bulk ingestion.
 
     1. Validate the file is a .csv.
     2. Save the uploaded file to the uploads/ directory.
-    3. Create a Job row with type ``csv_ingestion`` and status ``PENDING``.
+    3. Create a Job row with type ``csv_ingestion`` and status ``PENDING``,
+       owned by the caller.
     4. Dispatch the ``ingest_csv`` Celery task.
     5. Return the job immediately — the client opens a WebSocket on
        ``/ws/jobs/{job_id}`` to receive live progress (processed / total rows).
+
+    Every row ingested is attributed to the caller. The CSV's own ``user_id``
+    column is ignored — see ``ingest_csv`` in tasks.py.
     """
     # ── Validate file type ────────────────────────────────────
     if not file.filename or not file.filename.lower().endswith(".csv"):
@@ -388,6 +445,7 @@ async def ingest_csv_file(
         },
         status=JobStatus.PENDING,
         celery_task_id=task_id,
+        user_id=current_user.id,
     )
     db.add(job)
 
@@ -401,6 +459,7 @@ async def ingest_csv_file(
         job_id=str(job.id),
         task_id=task_id,
         file_name=file.filename,
+        user_id=str(current_user.id),
     )
 
     return job

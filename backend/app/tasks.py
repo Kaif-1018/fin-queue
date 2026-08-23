@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import csv
 import traceback
-import uuid as uuid_pkg
 from collections import defaultdict
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -107,14 +106,6 @@ def _parse_amount(raw: str) -> Decimal:
         return Decimal(0)
 
 
-def _parse_uuid(raw: str) -> uuid_pkg.UUID:
-    """Parse a CSV user_id cell, minting a fresh UUID if it is unusable."""
-    try:
-        return uuid_pkg.UUID(raw) if raw else uuid_pkg.uuid4()
-    except ValueError:
-        return uuid_pkg.uuid4()
-
-
 def _parse_timestamp(raw: str) -> datetime:
     """Parse a CSV timestamp cell, falling back to now()."""
     try:
@@ -145,11 +136,15 @@ def generate_bulk_csv_report(self, job_id: str) -> dict:
 
     Workflow:
         1. Fetch the job from PostgreSQL and claim it (idempotency guard).
-        2. Extract user_id, start_date, end_date from the payload.
+        2. Read the owner off the job row and the date range from the payload.
         3. Query the Transactions table with chunked streaming (yield_per).
         4. Stream chunks into a CSV file in the exports/ directory.
         5. On success → status = COMPLETED, store file_path + total_rows.
         6. On failure → status = FAILED, store error details.
+
+    The user scoped is ``job.user_id`` — set from the authenticated caller when
+    the job was created. It is deliberately *not* read from the payload: a
+    caller-supplied user id is how this task used to export anybody's history.
 
     Every status change goes through ``transition_sync``, which locks the row,
     validates the move, commits, and publishes to Redis as one call.
@@ -172,15 +167,30 @@ def generate_bulk_csv_report(self, job_id: str) -> dict:
 
         log.info("report.started", job_id=job_id)
 
+        # ── Resolve the owner ─────────────────────────────────
+        # A NULL owner is a job that predates auth. Fail it rather than run the
+        # query unscoped: an unfiltered export would dump every user's
+        # transactions into a file the requester can download.
+        user_id = job.user_id
+        if user_id is None:
+            error_result = {
+                "error": (
+                    "This job has no owner (created before authentication "
+                    "existed). Resubmit it as a logged-in user."
+                ),
+            }
+            transition_sync(session, job_id, JobStatus.FAILED, error_result)
+            log.error("report.no_owner", job_id=job_id)
+            return {"job_id": job_id, "status": "FAILED", "error": error_result["error"]}
+
         # ── Extract payload parameters ────────────────────────
         payload = job.payload or {}
-        user_id = payload.get("user_id")
         start_date = payload.get("start_date")
         end_date = payload.get("end_date")
 
-        if not all([user_id, start_date, end_date]):
+        if not all([start_date, end_date]):
             error_result = {
-                "error": "Missing required payload fields: user_id, start_date, end_date",
+                "error": "Missing required payload fields: start_date, end_date",
             }
             transition_sync(session, job_id, JobStatus.FAILED, error_result)
             log.error("report.invalid_payload", job_id=job_id)
@@ -234,7 +244,9 @@ def generate_bulk_csv_report(self, job_id: str) -> dict:
                 "file_path": str(file_path),
                 "file_name": file_name,
                 "total_rows": total_rows,
-                "user_id": user_id,
+                # str(): user_id is a uuid.UUID off the ORM row now, and this
+                # dict is written to a JSONB column.
+                "user_id": str(user_id),
                 "start_date": start_date,
                 "end_date": end_date,
             }
@@ -278,10 +290,16 @@ def ingest_csv(self, job_id: str, file_path: str | None = None) -> dict:
     Workflow:
         1. Fetch the job from PostgreSQL and claim it (idempotency guard).
         2. Count total rows in the CSV.
-        3. Parse and batch-insert transactions into PostgreSQL.
+        3. Parse and batch-insert transactions into PostgreSQL, each attributed
+           to the job's owner.
         4. Calculate financial metrics (total volume, status breakdown, date ranges).
         5. On success → status = COMPLETED, store rich analytics & sample rows.
         6. On failure → status = FAILED, store error details.
+
+    **Every row is attributed to ``job.user_id``, and the CSV's own ``user_id``
+    column is ignored.** Trusting that column meant an upload could write rows
+    against any user id it named — and unparseable values were assigned a fresh
+    random UUID, seeding the table with owners who did not exist.
 
     Status changes go through ``transition_sync``. Progress updates do not — see
     the comment on the first ``publish_job_update_sync`` call below.
@@ -301,6 +319,22 @@ def ingest_csv(self, job_id: str, file_path: str | None = None) -> dict:
         if not claim_sync(session, job_id):
             log.info("ingest.claim_rejected", job_id=job_id, status=job.status.value)
             return {"job_id": job_id, "status": job.status.value, "skipped": True}
+
+        # ── Resolve the owner ─────────────────────────────────
+        # Checked before any parsing: every inserted row needs an owner, and
+        # there is no sensible value to invent for a job that predates auth.
+        owner_id = job.user_id
+        if owner_id is None:
+            error_result = {
+                "status": "FAILED",
+                "error": (
+                    "This job has no owner (created before authentication "
+                    "existed). Re-upload the file as a logged-in user."
+                ),
+            }
+            transition_sync(session, job_id, JobStatus.FAILED, error_result)
+            log.error("ingest.no_owner", job_id=job_id)
+            return {"job_id": job_id, "status": "FAILED", "error": error_result["error"]}
 
         # ── Resolve the source file ───────────────────────────
         file_path = file_path or (job.payload or {}).get("saved_path")
@@ -342,7 +376,6 @@ def ingest_csv(self, job_id: str, file_path: str | None = None) -> dict:
             total_amount = Decimal(0)
             status_counts: defaultdict[str, int] = defaultdict(int)
             status_amounts: defaultdict[str, Decimal] = defaultdict(lambda: Decimal(0))
-            user_ids: set[str] = set()
             min_date: datetime | None = None
             max_date: datetime | None = None
             sample_rows: list[dict] = []
@@ -352,8 +385,8 @@ def ingest_csv(self, job_id: str, file_path: str | None = None) -> dict:
             with open(file_path, "r", encoding="utf-8", newline="") as f:
                 reader = csv.DictReader(f)
                 for row in reader:
-                    # Extract fields with safe defaults
-                    parsed_user_id = _parse_uuid(row.get("user_id", "").strip())
+                    # Extract fields with safe defaults. Note what is *not* read:
+                    # row["user_id"]. Ownership comes from the job, not the file.
                     parsed_amount = _parse_amount(row.get("amount", "0").strip())
                     raw_status = row.get("status", "completed").strip().lower()
                     parsed_date = _parse_timestamp(row.get("created_at", "").strip())
@@ -362,7 +395,6 @@ def ingest_csv(self, job_id: str, file_path: str | None = None) -> dict:
                     total_amount += parsed_amount
                     status_counts[raw_status] += 1
                     status_amounts[raw_status] += parsed_amount
-                    user_ids.add(str(parsed_user_id))
 
                     if min_date is None or parsed_date < min_date:
                         min_date = parsed_date
@@ -373,7 +405,7 @@ def ingest_csv(self, job_id: str, file_path: str | None = None) -> dict:
                     if len(sample_rows) < 10:
                         sample_rows.append({
                             "id": row.get("id", processed + 1),
-                            "user_id": str(parsed_user_id),
+                            "user_id": str(owner_id),
                             "amount": _money(parsed_amount),
                             "status": raw_status,
                             "created_at": parsed_date.isoformat(),
@@ -382,7 +414,7 @@ def ingest_csv(self, job_id: str, file_path: str | None = None) -> dict:
                     # Queue transaction object
                     txn_batch.append(
                         Transaction(
-                            user_id=parsed_user_id,
+                            user_id=owner_id,
                             amount=parsed_amount,
                             status=raw_status,
                             created_at=parsed_date,
@@ -417,7 +449,6 @@ def ingest_csv(self, job_id: str, file_path: str | None = None) -> dict:
 
             # ── Mark as COMPLETED with rich analytics ─────────
             avg_amount = total_amount / processed if processed > 0 else Decimal(0)
-            primary_user_id = next(iter(user_ids)) if user_ids else None
 
             completed_result = {
                 "status": "COMPLETED",
@@ -428,8 +459,12 @@ def ingest_csv(self, job_id: str, file_path: str | None = None) -> dict:
                 "summary": {
                     "total_amount": _money(total_amount),
                     "avg_amount": _money(avg_amount),
-                    "primary_user_id": primary_user_id,
-                    "unique_users_count": len(user_ids),
+                    # Every row belongs to the uploader now, so the old
+                    # unique_users_count / primary_user_id pair reduced to a
+                    # constant 1 and the owner. Report the owner plainly, plus
+                    # the distinct-status count, which still varies by file.
+                    "owner_id": str(owner_id),
+                    "distinct_statuses": len(status_counts),
                     "start_date": min_date.isoformat() if min_date else None,
                     "end_date": max_date.isoformat() if max_date else None,
                     "status_counts": dict(status_counts),

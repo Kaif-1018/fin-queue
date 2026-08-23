@@ -19,6 +19,18 @@ redis==5.0.7
 # Settings management
 pydantic-settings==2.3.4
 
+# Auth — password hashing and JWT
+# bcrypt is used directly rather than through passlib: passlib 1.7.4 reads
+# bcrypt.__about__, which bcrypt 4.x removed, and raises on import.
+bcrypt==4.2.0
+pyjwt==2.9.0
+
+# Pydantic EmailStr
+email-validator==2.2.0
+
+# Form parsing — OAuth2PasswordRequestForm (login) and UploadFile (ingest)
+python-multipart==0.0.9
+
 # Structured logging
 structlog==24.2.0
 

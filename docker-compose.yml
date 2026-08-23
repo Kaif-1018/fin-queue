@@ -47,6 +47,10 @@ services:
       REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/0
       CELERY_RESULT_BACKEND: redis://redis:6379/1
+      # Interpolated from a root .env if present (see .env.example), otherwise
+      # the development placeholder. config.py refuses to boot with the
+      # placeholder when DEBUG=False.
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-dev-only-insecure-secret-change-me}
     depends_on:
       postgres:
         condition: service_healthy
@@ -70,6 +74,10 @@ services:
       REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/0
       CELERY_RESULT_BACKEND: redis://redis:6379/1
+      # The worker never verifies a token, but it imports the same Settings, and
+      # that model validator runs at import. Keeping the two services in sync
+      # stops the worker crash-looping the moment DEBUG is turned off.
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-dev-only-insecure-secret-change-me}
     depends_on:
       postgres:
         condition: service_healthy

@@ -7,11 +7,69 @@ import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
 
-from sqlalchemy import DateTime, Enum, Index, Integer, Numeric, String, text
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    Enum,
+    ForeignKey,
+    Index,
+    Integer,
+    Numeric,
+    String,
+    text,
+)
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
+
+
+class User(Base):
+    """An authenticated account. Owns jobs, and the transactions they ingest."""
+
+    __tablename__ = "users"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=text("gen_random_uuid()"),
+    )
+    # 320 = 64-char local part + "@" + 255-char domain, the RFC 5321 maximum.
+    email: Mapped[str] = mapped_column(
+        String(320),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    # The bcrypt hash, never the password. Excluded from UserResponse so it
+    # cannot be serialised out of an endpoint by accident.
+    hashed_password: Mapped[str] = mapped_column(
+        String(128),
+        nullable=False,
+    )
+    is_active: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=True,
+        server_default=text("true"),
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        server_default=text("now()"),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        server_default=text("now()"),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    def __repr__(self) -> str:
+        return f"<User id={self.id} email={self.email}>"
 
 
 class JobStatus(str, enum.Enum):
@@ -33,12 +91,28 @@ class Job(Base):
     """Represents an asynchronous job submitted to the platform."""
 
     __tablename__ = "jobs"
+    __table_args__ = (
+        # Every job listing filters by owner and orders by created_at DESC, so
+        # this pair is the hot path. Mirrors ix_transactions_user_date below.
+        Index("ix_jobs_user_created", "user_id", "created_at"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         primary_key=True,
         default=uuid.uuid4,
         server_default=text("gen_random_uuid()"),
+    )
+    # Nullable because jobs created before auth existed have no owner. Those
+    # rows are unreachable by design: every query filters on an authenticated
+    # user's id, and NULL matches nobody. Do not treat a NULL owner as
+    # "belongs to everyone" — in the report task that would mean a full-table
+    # export. See generate_bulk_csv_report in tasks.py.
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=True,
+        default=None,
     )
     job_type: Mapped[str] = mapped_column(
         String(128),
@@ -106,6 +180,12 @@ class Transaction(Base):
         primary_key=True,
         autoincrement=True,
     )
+    # Deliberately *not* a ForeignKey to users.id. Rows seeded before auth
+    # existed hold UUIDs that were never real users, so the constraint could
+    # not validate. Rows written by ingest_csv now carry the uploading job's
+    # owner (the CSV's own user_id column is ignored), so new data is
+    # consistent; a real FK becomes possible after a full reseed, or via
+    # ADD CONSTRAINT ... NOT VALID to enforce on new rows only.
     user_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         nullable=False,

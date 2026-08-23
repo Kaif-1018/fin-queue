@@ -7,6 +7,30 @@ const WS_BASE = API_BASE
   ? API_BASE.replace(/^http/, 'ws')
   : `ws://${window.location.host}`;
 
+// ── Auth token storage ────────────────────────────────────────────
+// localStorage rather than memory so a page reload does not log you out, and
+// rather than a cookie because the API authenticates with a bearer header.
+// The tradeoff is XSS reach: any script on this origin can read it.
+const TOKEN_KEY = 'jobplatform.token';
+
+const readToken = () => {
+  try {
+    return localStorage.getItem(TOKEN_KEY);
+  } catch {
+    // Private mode or blocked site data — run without persistence.
+    return null;
+  }
+};
+
+const writeToken = (token) => {
+  try {
+    if (token) localStorage.setItem(TOKEN_KEY, token);
+    else localStorage.removeItem(TOKEN_KEY);
+  } catch {
+    // Non-fatal: the session still works, it just won't survive a reload.
+  }
+};
+
 // ── Status badge colours ──────────────────────────────────────────
 const STATUS_STYLES = {
   PENDING:    { bg: '#fef3c7', color: '#92400e', label: 'PENDING' },
@@ -45,17 +69,183 @@ const WS_STATE = {
 const MAX_RECONNECT_ATTEMPTS = 3;
 const RECONNECT_DELAY_MS = 1500;
 
+// WebSocket close codes the server uses to reject a connection. Both are
+// permanent for this token, so reconnecting would just fail again in a loop.
+const WS_CLOSE_UNAUTHORISED = 4401;
+const WS_CLOSE_NOT_FOUND = 4404;
+
+// ── Auth screen ───────────────────────────────────────────────────
+
+function AuthGate({ onAuthenticated }) {
+  const [mode, setMode] = useState('login');   // 'login' | 'register'
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [error, setError] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  const isRegister = mode === 'register';
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setBusy(true);
+    setError(null);
+
+    try {
+      if (isRegister) {
+        const res = await fetch(`${API_BASE}/api/v1/auth/register`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email, password }),
+        });
+        if (!res.ok) {
+          const data = await res.json().catch(() => ({}));
+          throw new Error(detailToMessage(data.detail) || `Registration failed (${res.status})`);
+        }
+      }
+
+      // Login uses form encoding, not JSON: the API implements the OAuth2
+      // password flow, which specifies application/x-www-form-urlencoded and
+      // names the identifier field "username".
+      const body = new URLSearchParams({ username: email, password });
+      const res = await fetch(`${API_BASE}/api/v1/auth/login`, { method: 'POST', body });
+
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(detailToMessage(data.detail) || `Login failed (${res.status})`);
+      }
+
+      const { access_token } = await res.json();
+      writeToken(access_token);
+      onAuthenticated(access_token);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="app">
+      <header className="app-header">
+        <h1>⚡ Job Processing Platform</h1>
+        <p className="subtitle">Sign in to submit jobs and view your ingestion history</p>
+      </header>
+
+      <section className="submit-section">
+        <div className="submit-card auth-card">
+          <label htmlFor="auth-email">{isRegister ? 'Create an account' : 'Sign in'}</label>
+
+          <form onSubmit={submit} className="auth-form">
+            <input
+              id="auth-email"
+              type="email"
+              className="auth-input"
+              placeholder="you@example.com"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              autoComplete="username"
+              required
+            />
+            <input
+              id="auth-password"
+              type="password"
+              className="auth-input"
+              placeholder="Password (8+ characters)"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              autoComplete={isRegister ? 'new-password' : 'current-password'}
+              minLength={8}
+              required
+            />
+
+            <button type="submit" className="auth-submit" disabled={busy}>
+              {busy ? 'Working…' : isRegister ? 'Register & sign in' : 'Sign in'}
+            </button>
+          </form>
+
+          {error && (
+            <div className="ws-error auth-error">
+              <span className="ws-error-icon">⚠️</span>
+              {error}
+            </div>
+          )}
+
+          <button
+            type="button"
+            className="raw-toggle-btn auth-toggle"
+            onClick={() => { setMode(isRegister ? 'login' : 'register'); setError(null); }}
+          >
+            {isRegister ? 'Already have an account? Sign in' : 'Need an account? Register'}
+          </button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+// FastAPI returns `detail` as a string for HTTPException and as a list of error
+// objects for a 422 validation failure. Rendering the raw list gives the user
+// "[object Object]", so flatten it.
+function detailToMessage(detail) {
+  if (!detail) return null;
+  if (typeof detail === 'string') return detail;
+  if (Array.isArray(detail)) {
+    return detail.map(d => d.msg || JSON.stringify(d)).join('; ');
+  }
+  return JSON.stringify(detail);
+}
+
 export default function App() {
+  const [token, setToken] = useState(readToken);
+
+  // Remounting on token change resets every piece of dashboard state at once —
+  // jobs, sockets, expanded panels. Without the key, logging in as a second
+  // user would leave the first user's job cards on screen.
+  if (!token) {
+    return <AuthGate onAuthenticated={setToken} />;
+  }
+
+  return (
+    <Dashboard
+      key={token}
+      token={token}
+      onSignOut={() => { writeToken(null); setToken(null); }}
+    />
+  );
+}
+
+function Dashboard({ token, onSignOut }) {
   const [selectedFile, setSelectedFile] = useState(null);
   const [submitting, setSubmitting] = useState(false);
   const [jobs, setJobs] = useState([]);
   const [expandedTables, setExpandedTables] = useState({});
   const [expandedRaw, setExpandedRaw] = useState({});
   const [generatingReportFor, setGeneratingReportFor] = useState(null);
+  const [authError, setAuthError] = useState(null);
 
   const wsRefs = useRef({});
   const terminalJobsRef = useRef(new Set());
   const fileInputRef = useRef(null);
+
+  // ── Authenticated fetch ─────────────────────────────────────────
+  // Every call to the API goes through this. A 401 means the token expired or
+  // was revoked, and the only useful response is to sign out — otherwise an
+  // expired session presents as a dashboard where nothing works and nothing
+  // says why.
+  const authFetch = useCallback(async (path, options = {}) => {
+    const headers = new Headers(options.headers || {});
+    headers.set('Authorization', `Bearer ${token}`);
+
+    const res = await fetch(`${API_BASE}${path}`, { ...options, headers });
+
+    if (res.status === 401) {
+      setAuthError('Your session expired. Please sign in again.');
+      onSignOut();
+      throw new Error('Session expired');
+    }
+
+    return res;
+  }, [token, onSignOut]);
 
   const toggleTable = (jobId) => {
     setExpandedTables(prev => ({ ...prev, [jobId]: !prev[jobId] }));
@@ -80,7 +270,10 @@ export default function App() {
 
     setJobs(prev => prev.map(j => (j.id === jobId ? { ...j, wsState: WS_STATE.CONNECTING, wsError: null } : j)));
 
-    const ws = new WebSocket(`${WS_BASE}/ws/jobs/${jobId}`);
+    // The token goes in the query string because a browser WebSocket cannot
+    // send an Authorization header — the constructor takes a URL and
+    // subprotocols, nothing else. See the module docstring in app/api/v1/ws.py.
+    const ws = new WebSocket(`${WS_BASE}/ws/jobs/${jobId}?token=${encodeURIComponent(token)}`);
     wsRefs.current[jobId] = { ws, attempts: attempt, timer: null };
 
     ws.onopen = () => {
@@ -143,6 +336,20 @@ export default function App() {
       const ref = wsRefs.current[jobId];
       if (!ref) return;
 
+      // 4401 / 4404 are the server's rejections: bad token, or a job this user
+      // does not own. Neither improves by retrying, so surface it and stop —
+      // reconnecting would spend three attempts arriving at the same answer.
+      if (event.code === WS_CLOSE_UNAUTHORISED || event.code === WS_CLOSE_NOT_FOUND) {
+        const message = event.code === WS_CLOSE_UNAUTHORISED
+          ? 'Live stream refused: session is no longer valid.'
+          : 'Live stream refused: job not found.';
+        setJobs(prev => prev.map(j => (
+          j.id === jobId ? { ...j, wsState: WS_STATE.ERROR, wsError: message } : j
+        )));
+        delete wsRefs.current[jobId];
+        return;
+      }
+
       const isTerminal = terminalJobsRef.current.has(jobId) || event.code === 1000;
 
       if (isTerminal) {
@@ -185,12 +392,14 @@ export default function App() {
     ws.onerror = () => {
       console.error(`WebSocket error for job ${jobId}`);
     };
-  }, []);
+    // token is a dependency: a reconnect must carry the *current* token, not the
+    // one captured when this component first rendered.
+  }, [token]);
 
   // ── Fetch existing jobs from backend ────────────────────────────
   const fetchJobs = useCallback(async () => {
     try {
-      const res = await fetch(`${API_BASE}/api/v1/jobs?limit=25`);
+      const res = await authFetch('/api/v1/jobs?limit=25');
       if (!res.ok) return;
       const data = await res.json();
       if (Array.isArray(data.items)) {
@@ -222,7 +431,7 @@ export default function App() {
     } catch (err) {
       console.warn('Could not load jobs:', err);
     }
-  }, []);
+  }, [authFetch]);
 
   useEffect(() => {
     fetchJobs();
@@ -254,14 +463,14 @@ export default function App() {
       const formData = new FormData();
       formData.append('file', selectedFile);
 
-      const res = await fetch(`${API_BASE}/api/v1/jobs/ingest`, {
+      const res = await authFetch('/api/v1/jobs/ingest', {
         method: 'POST',
         body: formData,
       });
 
       if (!res.ok) {
         const errorData = await res.json().catch(() => ({}));
-        throw new Error(errorData.detail || `HTTP ${res.status}`);
+        throw new Error(detailToMessage(errorData.detail) || `HTTP ${res.status}`);
       }
 
       const data = await res.json();
@@ -292,37 +501,38 @@ export default function App() {
     }
   };
 
-  // ── Post-processing action: Generate report for ingested user ───
+  // ── Post-processing action: export the caller's transactions ────
   const triggerReportForJob = async (job) => {
     const summary = job.result?.summary;
-    if (!summary?.primary_user_id) {
-      alert('No user ID found in this dataset.');
-      return;
-    }
 
     setGeneratingReportFor(job.id);
     try {
-      const startDate = summary.start_date ? summary.start_date.split('T')[0] : '2024-01-01';
-      const endDate = summary.end_date ? summary.end_date.split('T')[0] : '2026-12-31';
+      // Date range only. The report is always scoped to the signed-in user —
+      // the server reads the owner off the job row and there is no user_id field
+      // on this request to set. Sending one would be a 422.
+      const startDate = summary?.start_date ? summary.start_date.split('T')[0] : '2024-01-01';
+      const endDate = summary?.end_date ? summary.end_date.split('T')[0] : '2026-12-31';
 
-      const res = await fetch(`${API_BASE}/api/v1/jobs/reports`, {
+      const res = await authFetch('/api/v1/jobs/reports', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          user_id: summary.primary_user_id,
           start_date: startDate,
           end_date: endDate,
         }),
       });
 
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!res.ok) {
+        const errorData = await res.json().catch(() => ({}));
+        throw new Error(detailToMessage(errorData.detail) || `HTTP ${res.status}`);
+      }
       const data = await res.json();
 
       const reportJob = {
         id: data.id,
         status: data.status,
         jobType: 'bulk_csv_report',
-        fileName: `Export for User ${summary.primary_user_id.slice(0, 8)}…`,
+        fileName: `Export ${startDate} → ${endDate}`,
         events: [{ time: new Date().toLocaleTimeString(), status: data.status }],
         result: null,
         progress: null,
@@ -332,7 +542,6 @@ export default function App() {
 
       setJobs(prev => [reportJob, ...prev]);
       openWebSocket(data.id);
-      alert(`Report export job queued! Job ID: ${data.id}`);
     } catch (err) {
       console.error('Failed to generate report:', err);
       alert(`Could not start report generation: ${err.message}`);
@@ -344,9 +553,23 @@ export default function App() {
   return (
     <div className="app">
       <header className="app-header">
-        <h1>⚡ Job Processing Platform</h1>
-        <p className="subtitle">Async CSV Bulk Ingestion, Database Storage & Live Analytics</p>
+        <div className="header-bar">
+          <div className="header-titles">
+            <h1>⚡ Job Processing Platform</h1>
+            <p className="subtitle">Async CSV Bulk Ingestion, Database Storage & Live Analytics</p>
+          </div>
+          <button className="signout-btn" onClick={onSignOut} title="Sign out">
+            Sign out
+          </button>
+        </div>
       </header>
+
+      {authError && (
+        <div className="ws-error auth-error">
+          <span className="ws-error-icon">⚠️</span>
+          {authError}
+        </div>
+      )}
 
       {/* ── Submit Card ─────────────────────────────────────────── */}
       <section className="submit-section">
@@ -494,8 +717,8 @@ export default function App() {
                           </span>
                         </div>
                         <div className="kpi-card">
-                          <span className="kpi-label">Unique Users</span>
-                          <span className="kpi-value">{summary.unique_users_count || 1}</span>
+                          <span className="kpi-label">Distinct Statuses</span>
+                          <span className="kpi-value">{summary.distinct_statuses ?? Object.keys(summary.status_counts || {}).length}</span>
                         </div>
                       </div>
 
@@ -525,15 +748,13 @@ export default function App() {
                           </button>
                         )}
 
-                        {summary.primary_user_id && (
-                          <button
-                            className="action-btn btn-primary"
-                            onClick={() => triggerReportForJob(job)}
-                            disabled={generatingReportFor === job.id}
-                          >
-                            {generatingReportFor === job.id ? '⚡ Triggering Report…' : '📥 Generate Export Report'}
-                          </button>
-                        )}
+                        <button
+                          className="action-btn btn-primary"
+                          onClick={() => triggerReportForJob(job)}
+                          disabled={generatingReportFor === job.id}
+                        >
+                          {generatingReportFor === job.id ? '⚡ Triggering Report…' : '📥 Generate Export Report'}
+                        </button>
                       </div>
 
                       {/* ── Interactive Transactions Table ──────── */}

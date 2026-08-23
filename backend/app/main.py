@@ -10,6 +10,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
+from app.api.v1.auth import router as auth_router
 from app.api.v1.jobs import router as jobs_router
 from app.api.v1.ws import router as ws_router
 from app.config import settings
@@ -86,6 +87,7 @@ app.add_middleware(
 
 
 # ── Routers ───────────────────────────────────────────────────────
+app.include_router(auth_router, prefix="/api/v1")
 app.include_router(jobs_router, prefix="/api/v1")
 app.include_router(ws_router)
 
