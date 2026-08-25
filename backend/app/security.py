@@ -8,6 +8,7 @@ running Postgres. The parts that *do* need a session live in :mod:`app.deps`.
 
 from __future__ import annotations
 
+import re
 import uuid as uuid_pkg
 from datetime import datetime, timedelta, timezone
 
@@ -27,6 +28,17 @@ log = get_logger(__name__)
 # (see UserCreate.max_length) and assert the invariant here too.
 
 BCRYPT_MAX_BYTES = 72
+
+# A well-formed bcrypt hash: version tag, two-digit cost, then 53 characters of
+# radix-64 salt and digest — 60 in total.
+#
+# This is checked before calling into bcrypt because bcrypt 4.x is a Rust
+# extension, and a structurally invalid hash makes it *panic* rather than raise:
+# pyo3 surfaces that as PanicException, which derives from BaseException and so
+# slips past `except Exception` entirely. Letting one reach checkpw would break
+# verify_password's "never raises" contract and turn a corrupt column value into
+# an unhandled teardown of the login request.
+_BCRYPT_HASH = re.compile(r"^\$2[abxy]\$\d{2}\$[./A-Za-z0-9]{53}$")
 
 
 class PasswordTooLong(ValueError):
@@ -52,11 +64,18 @@ def hash_password(raw: str) -> str:
 
 def verify_password(raw: str, hashed: str) -> bool:
     """True if *raw* matches *hashed*. Never raises."""
+    if not _BCRYPT_HASH.match(hashed):
+        # Not a bcrypt hash at all: a truncated column, a placeholder, or a
+        # scheme this build cannot verify. Failing the check is correct, and it
+        # keeps a malformed value out of the Rust extension (see _BCRYPT_HASH).
+        log.warning("auth.stored_hash_malformed", length=len(hashed))
+        return False
+
     try:
         return bcrypt.checkpw(_encode(raw), hashed.encode("utf-8"))
     except (PasswordTooLong, ValueError, TypeError):
-        # A malformed stored hash or an over-long candidate is a failed
-        # verification, not an error the caller should have to handle.
+        # An over-long candidate is a failed verification, not an error the
+        # caller should have to handle.
         return False
 
 

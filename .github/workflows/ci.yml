@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A second push to the same branch makes the first run's result irrelevant.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Lint and test
+    runs-on: ubuntu-latest
+
+    # The suite needs a real Postgres — the code depends on JSONB, a native enum,
+    # gen_random_uuid(), and SELECT ... FOR UPDATE. Redis is needed because the
+    # Celery tasks publish progress through it, and ingest_csv's publish calls are
+    # deliberately not wrapped in a try/except.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: jobplatform
+          POSTGRES_PASSWORD: jobplatform_secret
+          POSTGRES_DB: jobplatform_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U jobplatform -d jobplatform_db"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # conftest.py derives the throwaway `jobplatform_db_test` from this and
+      # creates it via the always-present `postgres` maintenance database, so
+      # nothing here needs to pre-create a schema.
+      DATABASE_URL: postgresql+asyncpg://jobplatform:jobplatform_secret@localhost:5432/jobplatform_db
+      REDIS_URL: redis://localhost:6379/0
+      CELERY_BROKER_URL: redis://localhost:6379/0
+      CELERY_RESULT_BACKEND: redis://localhost:6379/1
+      # Keeps config.py's production-secret validator satisfied without putting a
+      # real key in the workflow. Nothing here verifies a token against anything
+      # but itself.
+      DEBUG: "true"
+
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Matches backend/Dockerfile, so a version-specific failure shows up
+          # here rather than only in the container.
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements*.txt
+
+      - name: Install dependencies
+        # requirements-dev.txt pulls in requirements.txt itself.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Check formatting of the test suite
+        # Scoped to tests/ deliberately. The application code predates this
+        # workflow and is not ruff-formatted; reformatting it is its own commit,
+        # not something CI should start failing over. New test code stays tidy.
+        run: ruff format --check tests/
+
+      - name: Run tests
+        # Migrations run inside the suite (conftest.py), which also proves the
+        # Alembic chain applies cleanly to an empty database.
+        run: pytest
