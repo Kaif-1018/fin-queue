@@ -88,6 +88,30 @@ services:
       - exports_data:/app/exports
       - uploads_data:/app/uploads
 
+  # ─── Celery Beat (Periodic Scheduler) ─────────────────────────
+  celery_beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: jobplatform-celery-beat
+    restart: unless-stopped
+    command: celery -A app.celery_app:celery_app beat --loglevel=info
+    environment:
+      DATABASE_URL: postgresql+asyncpg://jobplatform:jobplatform_secret@postgres:5432/jobplatform_db
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-dev-only-insecure-secret-change-me}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+      - exports_data:/app/exports
+      - uploads_data:/app/uploads
+
   # ─── React Frontend (nginx) ─────────────────────────────────────
   frontend:
     build:

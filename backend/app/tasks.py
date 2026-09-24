@@ -13,9 +13,10 @@ import traceback
 from collections import defaultdict
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
+from typing import Any
 
 from sqlalchemy import Engine, create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
@@ -72,6 +73,8 @@ def reset_sync_engine() -> None:
 # ── Directories & constants ───────────────────────────────────────
 EXPORTS_DIR = Path("exports")
 EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
+UPLOADS_DIR = Path("uploads")
+UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
 CSV_HEADERS = ["id", "user_id", "amount", "status", "created_at"]
 
@@ -505,3 +508,146 @@ TASK_REGISTRY = {
     "bulk_csv_report": generate_bulk_csv_report,
     "csv_ingestion": ingest_csv,
 }
+
+
+# ── Periodic maintenance tasks (Day 13) ───────────────────────────
+
+
+@celery_app.task(bind=True, name="app.tasks.prune_stale_files")
+def prune_stale_files(
+    self,
+    exports_retention_hours: int | None = None,
+    uploads_retention_hours: int | None = None,
+) -> dict[str, int]:
+    """Prune exported reports and ingested upload files older than their retention threshold.
+
+    Periodic maintenance run by Celery Beat to prevent Docker volumes (exports_data,
+    uploads_data) from unbounded disk growth.
+    """
+    exp_hours = (
+        exports_retention_hours
+        if exports_retention_hours is not None
+        else settings.EXPORTS_RETENTION_HOURS
+    )
+    up_hours = (
+        uploads_retention_hours
+        if uploads_retention_hours is not None
+        else settings.UPLOADS_RETENTION_HOURS
+    )
+
+    now_ts = datetime.now(timezone.utc).timestamp()
+    exp_cutoff_ts = now_ts - (exp_hours * 3600)
+    up_cutoff_ts = now_ts - (up_hours * 3600)
+
+    pruned_exports = 0
+    pruned_uploads = 0
+    bytes_freed = 0
+
+    # Prune exports directory
+    if EXPORTS_DIR.exists() and EXPORTS_DIR.is_dir():
+        for path in EXPORTS_DIR.glob("*.csv"):
+            try:
+                stat = path.stat()
+                if stat.st_mtime < exp_cutoff_ts:
+                    size = stat.st_size
+                    path.unlink(missing_ok=True)
+                    pruned_exports += 1
+                    bytes_freed += size
+                    log.info("maintenance.pruned_export", file=path.name, size=size)
+            except OSError as exc:
+                log.warning("maintenance.prune_export_failed", file=path.name, error=str(exc))
+
+    # Prune uploads directory
+    if UPLOADS_DIR.exists() and UPLOADS_DIR.is_dir():
+        for path in UPLOADS_DIR.glob("*.csv"):
+            try:
+                stat = path.stat()
+                if stat.st_mtime < up_cutoff_ts:
+                    size = stat.st_size
+                    path.unlink(missing_ok=True)
+                    pruned_uploads += 1
+                    bytes_freed += size
+                    log.info("maintenance.pruned_upload", file=path.name, size=size)
+            except OSError as exc:
+                log.warning("maintenance.prune_upload_failed", file=path.name, error=str(exc))
+
+    summary = {
+        "pruned_exports": pruned_exports,
+        "pruned_uploads": pruned_uploads,
+        "bytes_freed": bytes_freed,
+    }
+    log.info(
+        "maintenance.prune_completed",
+        exports=pruned_exports,
+        uploads=pruned_uploads,
+        bytes_freed=bytes_freed,
+    )
+    return summary
+
+
+@celery_app.task(bind=True, name="app.tasks.reap_stale_jobs")
+def reap_stale_jobs(
+    self,
+    stale_threshold_minutes: int | None = None,
+) -> dict[str, Any]:
+    """Find and fail zombie jobs stuck in PROCESSING status.
+
+    When a worker process crashes, is OOM-killed, or the container restarts mid-job,
+    the job remains in PROCESSING forever because claim_sync() rejects duplicate
+    deliveries.
+
+    This periodic task finds jobs whose status is PROCESSING and whose updated_at
+    is older than `stale_threshold_minutes`, safely transitioning them to FAILED
+    via `transition_sync()` and notifying connected WebSocket clients.
+    """
+    threshold = (
+        stale_threshold_minutes
+        if stale_threshold_minutes is not None
+        else settings.STALE_JOB_THRESHOLD_MINUTES
+    )
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=threshold)
+
+    reaped_jobs: list[str] = []
+
+    with sync_session() as session:
+        stuck_jobs = (
+            session.execute(
+                select(Job.id).where(
+                    Job.status == JobStatus.PROCESSING,
+                    Job.updated_at < cutoff,
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+        for job_uuid in stuck_jobs:
+            job_id_str = str(job_uuid)
+            error_result = {
+                "status": "FAILED",
+                "error": (
+                    f"Job timed out: no worker activity detected for over "
+                    f"{threshold} minutes (stale job reaper)"
+                ),
+                "reaped_at": datetime.now(timezone.utc).isoformat(),
+            }
+            try:
+                transitioned = transition_sync(
+                    session,
+                    job_uuid,
+                    JobStatus.FAILED,
+                    error_result,
+                    strict=False,
+                )
+                if transitioned:
+                    reaped_jobs.append(job_id_str)
+                    log.warning("maintenance.reaped_stale_job", job_id=job_id_str)
+            except Exception as exc:
+                log.exception("maintenance.reap_failed", job_id=job_id_str, error=str(exc))
+
+    summary = {
+        "reaped_count": len(reaped_jobs),
+        "job_ids": reaped_jobs,
+    }
+    log.info("maintenance.reap_completed", count=len(reaped_jobs))
+    return summary

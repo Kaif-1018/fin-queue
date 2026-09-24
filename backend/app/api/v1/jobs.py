@@ -25,15 +25,17 @@ from app.logging_config import get_logger
 from app.models import Job, JobStatus, User
 from app.schemas import JobCreate, JobListResponse, JobResponse, ReportRequest
 from app.state import transition
-from app.tasks import EXPORTS_DIR, TASK_REGISTRY, generate_bulk_csv_report, ingest_csv
+from app.tasks import (
+    EXPORTS_DIR,
+    TASK_REGISTRY,
+    UPLOADS_DIR,
+    generate_bulk_csv_report,
+    ingest_csv,
+)
 
 log = get_logger(__name__)
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
-
-# ── Uploads directory ─────────────────────────────────────────────
-UPLOADS_DIR = Path("uploads")
-UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ── Ownership ─────────────────────────────────────────────────────

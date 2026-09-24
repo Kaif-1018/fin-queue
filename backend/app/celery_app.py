@@ -33,6 +33,18 @@ celery_app.conf.update(
 
     # Auto-discover tasks in app.tasks
     imports=["app.tasks"],
+
+    # Periodic maintenance schedule (Day 13)
+    beat_schedule={
+        "prune-stale-files-hourly": {
+            "task": "app.tasks.prune_stale_files",
+            "schedule": 3600.0,  # every hour
+        },
+        "reap-stale-jobs-every-15-minutes": {
+            "task": "app.tasks.reap_stale_jobs",
+            "schedule": 900.0,  # every 15 minutes
+        },
+    },
 )
 
 

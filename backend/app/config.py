@@ -49,6 +49,13 @@ class Settings(BaseSettings):
     # which is a data-leak risk anywhere real.
     SQL_ECHO: bool = False
 
+    # ── Maintenance & Celery Beat (Day 13) ────────────────────────
+    # Retention period in hours before files in exports/ and uploads/ are pruned.
+    EXPORTS_RETENTION_HOURS: int = 24
+    UPLOADS_RETENTION_HOURS: int = 24
+    # Inactivity threshold in minutes before a stuck PROCESSING job is reaped.
+    STALE_JOB_THRESHOLD_MINUTES: int = 30
+
     @model_validator(mode="after")
     def _reject_dev_secret_outside_debug(self) -> "Settings":
         """Refuse to start with the repo's placeholder signing key in production.
