@@ -221,6 +221,8 @@ function Dashboard({ token, onSignOut }) {
   const [expandedTables, setExpandedTables] = useState({});
   const [expandedRaw, setExpandedRaw] = useState({});
   const [generatingReportFor, setGeneratingReportFor] = useState(null);
+  const [cancellingJobId, setCancellingJobId] = useState(null);
+  const [downloadingJobId, setDownloadingJobId] = useState(null);
   const [authError, setAuthError] = useState(null);
 
   const wsRefs = useRef({});
@@ -550,6 +552,79 @@ function Dashboard({ token, onSignOut }) {
     }
   };
 
+  // ── Cancel a pending or queued job ──────────────────────────────
+  const cancelJob = async (jobId) => {
+    setCancellingJobId(jobId);
+    try {
+      const res = await authFetch(`/api/v1/jobs/${jobId}/cancel`, {
+        method: 'POST',
+      });
+
+      if (!res.ok) {
+        const errorData = await res.json().catch(() => ({}));
+        throw new Error(detailToMessage(errorData.detail) || `HTTP ${res.status}`);
+      }
+
+      const data = await res.json();
+      setJobs(prev =>
+        prev.map(j => {
+          if (j.id !== jobId) return j;
+          return {
+            ...j,
+            status: data.status,
+            result: data.result,
+            events: [
+              ...j.events,
+              { time: new Date().toLocaleTimeString(), status: data.status },
+            ],
+          };
+        })
+      );
+    } catch (err) {
+      console.error('Failed to cancel job:', err);
+      alert(`Could not cancel job: ${err.message}`);
+    } finally {
+      setCancellingJobId(null);
+    }
+  };
+
+  // ── Download a generated CSV report ─────────────────────────────
+  const downloadReport = async (jobId, fallbackFileName) => {
+    setDownloadingJobId(jobId);
+    try {
+      const res = await authFetch(`/api/v1/jobs/${jobId}/download`);
+
+      if (!res.ok) {
+        const errorData = await res.json().catch(() => ({}));
+        throw new Error(detailToMessage(errorData.detail) || `HTTP ${res.status}`);
+      }
+
+      const blob = await res.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+
+      // Extract filename from Content-Disposition header if present
+      const disposition = res.headers.get('content-disposition');
+      let fileName = fallbackFileName || `report_${jobId}.csv`;
+      if (disposition && disposition.includes('filename=')) {
+        const match = disposition.match(/filename="?([^"]+)"?/);
+        if (match && match[1]) fileName = match[1];
+      }
+
+      a.download = fileName;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      window.URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error('Failed to download report:', err);
+      alert(`Could not download report: ${err.message}`);
+    } finally {
+      setDownloadingJobId(null);
+    }
+  };
+
   return (
     <div className="app">
       <header className="app-header">
@@ -625,9 +700,11 @@ function Dashboard({ token, onSignOut }) {
           const isCompleted = job.status === 'COMPLETED';
           const isFailed = job.status === 'FAILED';
           const isCancelled = job.status === 'CANCELLED';
+          const isPending = job.status === 'PENDING' || job.status === 'QUEUED';
           const isProcessing = !isTerminal(job.status);
-          const totalRows = job.result?.total || job.progress?.total || 0;
-          const processedRows = job.result?.processed || job.progress?.processed || 0;
+          const isReport = job.jobType === 'bulk_csv_report';
+          const totalRows = job.result?.total || job.progress?.total || job.result?.total_rows || 0;
+          const processedRows = job.result?.processed || job.progress?.processed || (isCompleted ? totalRows : 0);
           const pct = isCompleted ? 100 : (job.progress?.percentage ?? 0);
           const summary = job.result?.summary;
           const sampleRows = job.result?.sample_rows || [];
@@ -642,7 +719,19 @@ function Dashboard({ token, onSignOut }) {
                     {job.jobType && <span className="job-type-pill">{job.jobType}</span>}
                   </div>
                 </div>
-                <StatusBadge status={job.status} />
+                <div className="job-header-right">
+                  {isPending && (
+                    <button
+                      className="cancel-job-btn"
+                      onClick={() => cancelJob(job.id)}
+                      disabled={cancellingJobId === job.id}
+                      title="Cancel this queued job"
+                    >
+                      {cancellingJobId === job.id ? 'Cancelling…' : '✕ Cancel'}
+                    </button>
+                  )}
+                  <StatusBadge status={job.status} />
+                </div>
               </div>
 
               {/* ── Live Progress Section ────────────────────────── */}
@@ -684,8 +773,52 @@ function Dashboard({ token, onSignOut }) {
                 </div>
               )}
 
-              {/* ── COMPLETED: Rich Analytics & Post-Processing ─── */}
-              {isCompleted && (
+              {/* ── COMPLETED: Report Export or Ingestion Analytics ─── */}
+              {isCompleted && isReport && (
+                <div className="result-card result-success result-report-card">
+                  <div className="result-card-header">
+                    <div>
+                      <span className="result-card-title">✅ CSV Report Generated</span>
+                      <span className="result-card-sub">
+                        {job.result?.message || `Successfully compiled ${totalRows.toLocaleString()} transaction records into CSV`}
+                      </span>
+                    </div>
+                  </div>
+
+                  <div className="report-download-box">
+                    <div className="report-download-meta">
+                      <span className="report-filename">📄 {job.result?.file_name || 'report.csv'}</span>
+                      {job.result?.start_date && job.result?.end_date && (
+                        <span className="report-dates">
+                          Range: {job.result.start_date.split('T')[0]} to {job.result.end_date.split('T')[0]}
+                        </span>
+                      )}
+                    </div>
+                    <button
+                      className="action-btn download-report-btn"
+                      onClick={() => downloadReport(job.id, job.result?.file_name)}
+                      disabled={downloadingJobId === job.id}
+                    >
+                      {downloadingJobId === job.id ? '⚡ Downloading…' : '📥 Download CSV Report'}
+                    </button>
+                  </div>
+
+                  {/* ── Raw JSON Toggle ──────────────────────── */}
+                  <div className="result-raw-toggle-wrapper">
+                    <button
+                      className="raw-toggle-btn"
+                      onClick={() => toggleRaw(job.id)}
+                    >
+                      {expandedRaw[job.id] ? 'Hide Raw JSON ▴' : 'View Raw JSON ▾'}
+                    </button>
+                    {expandedRaw[job.id] && (
+                      <pre className="job-result">{JSON.stringify(job.result, null, 2)}</pre>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {isCompleted && !isReport && (
                 <div className="result-card result-success">
                   <div className="result-card-header">
                     <div>
