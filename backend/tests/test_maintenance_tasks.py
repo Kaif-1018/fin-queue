@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from sqlalchemy import select, update
+from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from app.celery_app import celery_app
@@ -112,9 +112,7 @@ def test_reap_stale_jobs_marks_abandoned_processing_jobs_as_failed(
 
     # Age the updated_at timestamp to 45 minutes ago
     cutoff_time = datetime.now(timezone.utc) - timedelta(minutes=45)
-    sync_db.execute(
-        update(Job).where(Job.id == job.id).values(updated_at=cutoff_time)
-    )
+    sync_db.execute(update(Job).where(Job.id == job.id).values(updated_at=cutoff_time))
     sync_db.commit()
 
     outcome = reap_stale_jobs.run(stale_threshold_minutes=30)
@@ -153,17 +151,13 @@ def test_reap_stale_jobs_ignores_active_and_terminal_jobs(
         result={"file_name": "data.csv"},
     )
     sync_db.execute(
-        update(Job)
-        .where(Job.id == completed_job.id)
-        .values(updated_at=old_time)
+        update(Job).where(Job.id == completed_job.id).values(updated_at=old_time)
     )
 
     # Old cancelled job
     cancelled_job = make_sync_job(owner=sync_user, status=JobStatus.CANCELLED)
     sync_db.execute(
-        update(Job)
-        .where(Job.id == cancelled_job.id)
-        .values(updated_at=old_time)
+        update(Job).where(Job.id == cancelled_job.id).values(updated_at=old_time)
     )
 
     sync_db.commit()
